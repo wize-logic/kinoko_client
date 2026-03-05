@@ -166,6 +166,10 @@ void __declspec(naked) CUIQuestInfoDetail__Draw_hook() {
 
 
 void AttachClientHelper() {
+    // EqSlotInfo sEqSlotInfo[BP_PETWEAR] - fix pet equip slot position
+    Patch4(0x00C614C0, 110);
+    Patch4(0x00C614C4, 89);
+
     // CChatHelper::TryChat
     Patch1(0x004AA7EF, 0xEB); // bypass chat cooldown
     Patch1(0x004AA74A, 0xEB); // bypass chat repeat
