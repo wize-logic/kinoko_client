@@ -2,6 +2,7 @@
 #include "hook.h"
 #include "ztl/ztl.h"
 #include "wvs/util.h"
+#include "wvs/wvsapp.h"
 #include "wvs/wvscontext.h"
 #include "wvs/temporarystatview.h"
 #include <timeapi.h>
@@ -11,6 +12,7 @@
 #define COOLTIME_OFFSET_HEIGHT 40
 
 
+static int g_tLastUpdate = -1;
 static IWzPropertyPtr g_pPropSecond;
 static CTemporaryStatView g_tsvCooltime;
 
@@ -40,6 +42,7 @@ static auto CTemporaryStatView__Update = reinterpret_cast<void(__thiscall*)(CTem
 void __fastcall CTemporaryStatView__Update_hook(CTemporaryStatView* pThis, void* _EDX) {
     CTemporaryStatView__Update(pThis);
     CTemporaryStatView__Update(&g_tsvCooltime);
+    g_tLastUpdate = CWvsApp::GetInstance()->m_tUpdateTime;
 }
 
 static auto CTemporaryStatView__AdjustPosition = reinterpret_cast<void(__thiscall*)(CTemporaryStatView*)>(0x0075CAD0);
@@ -149,6 +152,14 @@ void __fastcall TEMPORARY_STAT__UpdateShadowIndex_hook(CTemporaryStatView::TEMPO
 }
 
 
+static auto TEMPORARY_STAT__SetLeft = reinterpret_cast<void(__thiscall*)(CTemporaryStatView::TEMPORARY_STAT*, int)>(0x0075DA00);
+
+void __fastcall TEMPORARY_STAT__SetLeft_hook(CTemporaryStatView::TEMPORARY_STAT* pThis, void* _EDX, int tNewLeft) {
+    int tDelta = g_tLastUpdate < 0 ? -30 : g_tLastUpdate - CWvsApp::GetInstance()->m_tUpdateTime;
+    TEMPORARY_STAT__SetLeft(pThis, pThis->tLeft + tDelta);
+}
+
+
 void AttachTemporaryStatMod() {
     ATTACH_HOOK(CTemporaryStatView__Clear, CTemporaryStatView__Clear_hook);
     ATTACH_HOOK(CTemporaryStatView__Show, CTemporaryStatView__Show_hook);
@@ -158,4 +169,5 @@ void AttachTemporaryStatMod() {
     ATTACH_HOOK(CWvsContext__SetSkillCooltimeOver, CWvsContext__SetSkillCooltimeOver_hook);
     ATTACH_HOOK(CWvsContext__RemoveSkillCooltimeReset, CWvsContext__RemoveSkillCooltimeReset_hook);
     ATTACH_HOOK(TEMPORARY_STAT__UpdateShadowIndex, TEMPORARY_STAT__UpdateShadowIndex_hook);
+    PatchCall(0x0075DCCC, reinterpret_cast<uintptr_t>(&TEMPORARY_STAT__SetLeft_hook)); // CTemporaryStatView::Update
 }
