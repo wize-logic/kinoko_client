@@ -22,6 +22,15 @@ struct GW_ItemSlotBase : public ZRefCounted {
     MEMBER_AT(TSecType<int32_t>, 0xC, nItemID)
     MEMBER_AT(_LARGE_INTEGER, 0x18, liCashItemSN)
 
+    virtual ~GW_ItemSlotBase() = 0;
+    virtual int IsProtectedItem() = 0;
+    virtual int IsPreventSlipItem() = 0;
+    virtual int IsSupportWarmItem() = 0;
+    virtual int IsBindedItem() = 0;
+    virtual int IsPossibleTradingItem() = 0;
+    virtual int GetType() = 0;
+    // ...
+
     int32_t IsCashItem() const {
         return liCashItemSN.QuadPart != 0;
     }

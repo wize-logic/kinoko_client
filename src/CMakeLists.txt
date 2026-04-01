@@ -11,6 +11,7 @@ add_library(injector SHARED
         stringpool.cpp
         temporarystat.cpp
         elementaldamage.cpp
+        itemicon.cpp
         walker.cpp
         debug.cpp
 )

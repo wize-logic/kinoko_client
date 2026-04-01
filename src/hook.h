@@ -43,6 +43,7 @@ void AttachStringPoolMod();
 void AttachSystemOptionMod();
 void AttachTemporaryStatMod();
 void AttachElementalDamageMod();
+void AttachIconIconMod();
 void AttachExceptionHandler();
 
 inline void AttachClientHooks() {
@@ -52,6 +53,7 @@ inline void AttachClientHooks() {
     AttachSystemOptionMod();
     AttachTemporaryStatMod();
     AttachElementalDamageMod();
+    AttachIconIconMod();
     AttachExceptionHandler();
 }
 
