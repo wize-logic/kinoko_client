@@ -191,6 +191,19 @@ void __fastcall CDialog__CreateDlg_hook(CDialog* pThis, void* _EDX, int32_t l, i
 }
 
 
+class CAvatarMegaphone : public CWnd {
+public:
+    MEMBER_AT(int, 0x2A0, m_nScreenWidth)
+};
+
+static auto CWnd__CreateWnd = reinterpret_cast<void(__thiscall*)(CWnd*, int, int, int, int, int, int, void*, int, int)>(0x009AD8F0);
+
+void __fastcall CAvatarMegaphone__CreateWnd_hook(CAvatarMegaphone* pThis, void* _EDX, int l, int t, int w, int h, int z, int bScreenCoord, void* pData, int bSetFocus, int org) {
+    pThis->m_nScreenWidth = CWvsContext::GetInstance()->m_nScreenWidth;
+    CWnd__CreateWnd(pThis, pThis->m_nScreenWidth, t, w, h, z, bScreenCoord, pData, bSetFocus, org);
+}
+
+
 void AttachSystemOptionMod() {
     ATTACH_HOOK(CUISysOpt__OnCreate, CUISysOpt__OnCreate_hook);
     ATTACH_HOOK(CUISysOpt__GetSysOptFromCtrl, CUISysOpt__GetSysOptFromCtrl_hook);
@@ -201,6 +214,11 @@ void AttachSystemOptionMod() {
 
     // CWorldMapDlg::CreateWorldMapDlg - center world map
     PatchCall(0x009BEA22, reinterpret_cast<uintptr_t>(&CDialog__CreateDlg_hook));
+
+    // CAvatarMegaphone::CAvatarMegaphone - patch screen width
+    PatchCall(0x0046DD42, reinterpret_cast<uintptr_t>(&CAvatarMegaphone__CreateWnd_hook));
+    Patch4(0x0046D66B + 1, 1920 + 100); // CAvatarMegaphone::ByeAvatarMegaphone
+    Patch4(0x0046D83D + 1, 1920 + 100); // CAvatarMegaphone::ByeAvatarMegaphone
 
     // CWvsApp::CreateWndManager - patch cursor boundary
     Patch4(0x009C20DF + 1, 1920);
