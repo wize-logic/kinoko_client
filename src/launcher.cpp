@@ -10,6 +10,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     ZeroMemory(&si, sizeof(si));
     ZeroMemory(&pi, sizeof(pi));
 
+    // Suppress Program Compatibility Assistant on Win10/11 — MapleStory.exe has no
+    // supportedOS manifest entries, so PCA hijacks it. Child inherits this env var.
+    SetEnvironmentVariableA("__COMPAT_LAYER", "WIN7RTM");
+
     if (!DetourCreateProcessWithDllExA("MapleStory.exe", lpCmdLine, NULL, NULL, FALSE, CREATE_SUSPENDED, NULL, NULL, &si, &pi, CONFIG_DLL_NAME, NULL)) {
         ErrorMessage("Could not start MapleStory.exe [%d]", GetLastError());
         return 1;
