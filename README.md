@@ -10,7 +10,7 @@ two binaries:
   etc.), patch resolution/UI, fix several v95.1 bugs, and redirect the client
   to a custom server.
 
-Kinoko is designed to talk to the [iw2d/kaentake](https://github.com/iw2d/kaentake)
+Kinoko is designed to talk to the [iw2d/kinoko](https://github.com/iw2d/kinoko)
 private server, but anything speaking the v95.1 protocol will work.
 
 ---
