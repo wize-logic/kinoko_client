@@ -40,4 +40,10 @@ public:
     void SetOpt_Int(int32_t nType, const char* sKey, int32_t nValue) {
         reinterpret_cast<void(__thiscall*)(CConfig*, int32_t, const char*, int32_t)>(0x004B2650)(this, nType, sKey, nValue);
     }
+    // Calls 0x004B2300 — i.e. whatever lives at the patched prologue, so post-AttachClientHooks
+    // this routes through CConfig__ApplySysOpt_hook (sysopt.cpp). Use the static
+    // `CConfig__ApplySysOpt` in sysopt.cpp directly when you need the trampoline (= original).
+    void ApplySysOpt(CONFIG_SYSOPT* pSysOpt, int32_t bApplyVideo) {
+        reinterpret_cast<void(__thiscall*)(CConfig*, CONFIG_SYSOPT*, int32_t)>(0x004B2300)(this, pSysOpt, bApplyVideo);
+    }
 };

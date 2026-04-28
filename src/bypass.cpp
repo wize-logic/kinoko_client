@@ -104,6 +104,10 @@ void __fastcall CWvsApp__SetUp_hook(CWvsApp* pThis, void* _EDX) {
     // then overlay 10 dwords at indices 0x40..0x4A with InitSafeDll() returns. The CRC-32
     // table init that follows in the original SetUp is harmless to drop (only consumed by
     // CWvsApp::Run, which is wholesale replaced by CWvsApp__Run_hook).
+    //
+    // Also intentionally drops the GetIpAddrTable / GetAdaptersInfo function-pointer
+    // self-check from `009cafb0.c:236-280` — that check verifies the IAT entries against
+    // a hash and would trip whenever we're injected via Detours. Bypass is by design.
     memcpy(reinterpret_cast<void*>(0x00C68848), reinterpret_cast<const void*>(0x00401234), 0x200);
     {
         auto pTable = reinterpret_cast<uint32_t*>(0x00C68848);
@@ -173,8 +177,7 @@ void __fastcall CWvsApp__SetUp_hook(CWvsApp* pThis, void* _EDX) {
     }
     // CWvsApp::CreateWndManager(this);
     reinterpret_cast<void(__thiscall*)(CWvsApp*)>(0x009C2060)(pThis);
-    // CConfig::ApplySysOpt(TSingleton<CConfig>::GetInstance(), nullptr, 0);
-    reinterpret_cast<void(__thiscall*)(CConfig*, CONFIG_SYSOPT*, int)>(0x004B2300)(CConfig::GetInstance(), nullptr, 0);
+    CConfig::GetInstance()->ApplySysOpt(nullptr, 0);
     // TSingleton<CActionMan>::CreateInstance()->Init();
     auto pActionMan = reinterpret_cast<void*(__cdecl*)()>(0x009C22A0)();
     reinterpret_cast<void(__thiscall*)(void*)>(0x0041BEB0)(pActionMan);
@@ -303,6 +306,9 @@ static auto CClientSocket__Connect = 0x004B0340;
 
 void __fastcall CClientSocket__Connect_hook(CClientSocket* pThis, void* _EDX, CClientSocket::CONNECTCONTEXT* ctx) {
     DEBUG_MESSAGE("CClientSocket::Connect");
+    // Intentionally drops the original anti-tamper byte check on Connect_inner's prologue
+    // (`004b0340.c:14-17` → `0x9c1960(8)` on mismatch). We hook the inner call path, so the
+    // check would always fire for us; reimplementing it would crash our own injection.
     pThis->m_ctxConnect.lAddr.RemoveAll();
     pThis->m_ctxConnect.lAddr.AddTail(ctx->lAddr);
     pThis->m_ctxConnect.posList = ctx->posList;

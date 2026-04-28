@@ -73,8 +73,8 @@ Status legend: `[ ]` open · `[x]` fixed · `[~]` won't fix / by design · `[-]`
 
 ## New findings from pseudocode
 
-- [~] **NEW-1** — `CClientSocket::Connect` hook drops anti-tamper byte check on `Connect_inner` prologue (`004b0340.c:14-17` → `0x9c1960(8)` on mismatch). Intentional bypass.
-- [~] **NEW-2** — `CWvsApp::SetUp` hook drops `GetIpAddrTable`/`GetAdaptersInfo` function-pointer self-check (`009cafb0.c:236-280`). Intentional bypass.
+- [~] **NEW-1** — `CClientSocket::Connect` hook drops anti-tamper byte check on `Connect_inner` prologue (`004b0340.c:14-17` → `0x9c1960(8)` on mismatch). Intentional bypass — documented in code (bypass.cpp::CClientSocket__Connect_hook).
+- [~] **NEW-2** — `CWvsApp::SetUp` hook drops `GetIpAddrTable`/`GetAdaptersInfo` function-pointer self-check (`009cafb0.c:236-280`). Intentional bypass — documented in code (bypass.cpp::CWvsApp__SetUp_hook).
 - [-] **NEW-3** — CRC-32 table at `0xC6F740` (poly `0xdd10ec81`) skipped. **HARMLESS** — only consumers are `Crc32_GetCrc32` (`0x009C0B00`), `Crc32_GetCrc32_VMCRC` (`0x009C1160`), `Crc32_GetCrc32_VMTable` (`0x009C1500`); all called only from `CWvsApp::Run` (`0x009C5F00`) which is wholesale-replaced by `CWvsApp__Run_hook` (`bypass.cpp:212-284`). Add a one-line comment near the SetUp hook noting the dependency.
 - [-] **NEW-4** — Refuted. `009ca8a0.c` has exactly two `FUN_00407350` calls (cache lines 56, 61), both already present in the hook for `m_sCSDVersion` (param_1[9] / +0x24) and `m_sCmdLine` (param_1[0xd] / +0x34). The `param_1[0xb..0xc]` slots are `m_tUpdateTime` and `m_bFirstUpdate` — plain int assignments, no ctor.
 
@@ -84,8 +84,8 @@ Status legend: `[ ]` open · `[x]` fixed · `[~]` won't fix / by design · `[-]`
 
 - [x] **I1** — `hook.cpp:139-175` — `Patch1`/`Patch4`/`PatchStr`/`PatchNop` ignore `VirtualProtect` failures
   - Fixed: each helper now logs via `DEBUG_MESSAGE` and bails when the RWX flip fails.
-- [ ] **I3** — `bypass.cpp:162` — duplicate `0x004B2300` cast; use `CConfig__ApplySysOpt` typed alias from `sysopt.cpp:105`
-  - (Skipped: dedup needs a shared header for two call sites; not worth it.)
+- [x] **I3** — `bypass.cpp:162` — duplicate `0x004B2300` cast; use `CConfig__ApplySysOpt` typed alias from `sysopt.cpp:105`
+  - Fixed: added `CConfig::ApplySysOpt` method in `wvs/config.h` matching the `GetOpt_Int`/`SetOpt_Int` shape; bypass.cpp's SetUp hook now calls `pConfig->ApplySysOpt(nullptr, 0)`. The static raw-address pointer in sysopt.cpp stays — it's the trampoline used by the hook to invoke the original.
 - [x] **I5** — `injector.cpp:53` — `_strdup` leak (process-lifetime); `static char[16]` would do
   - Fixed: copy into `static char s_sAddressBuf[16]` and point `g_sServerAddress` at it; preserves the null-pointer-means-default semantics.
 - [x] **I7** — `helper.cpp:103-128` — leading-space string literals in `get_attack_speed_string`; drop the spaces and let `%s (%d)` handle spacing
