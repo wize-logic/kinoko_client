@@ -376,9 +376,11 @@ void __fastcall CWvsContext__OnEnterField_hook(CWvsContext* pThis, void* _EDX) {
     reinterpret_cast<void(__thiscall*)(CTemporaryStatView*)>(0x0075C6A0)(&pThis->m_temporaryStatView);
     pThis->m_bKillMobFromEnterField = 0;
 
-    // CUIRaiseManager::RestoreWindows() — restore minimized/raised quest UI windows
-    // through ZRef<CUIRaiseManager> at this+0x3EA8.
-    auto pUIRaiseManager = *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(pThis) + 0x3EA8);
+    // CUIRaiseManager::RestoreWindows() — restore minimized/raised quest UI windows.
+    // ZRef<CUIRaiseManager> sits at this+0x3EA8 and ZRef<T>::operator T*() at 0x009CCA20
+    // is `mov eax, [ecx+4]; ret`, so the raw pointer lives at +0x3EAC. Reading +0x3EA8
+    // directly gives the refcount slot (typically 0) and lands a null in RestoreWindows.
+    auto pUIRaiseManager = *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(pThis) + 0x3EAC);
     reinterpret_cast<void(__thiscall*)(void*)>(0x0083C5B0)(pUIRaiseManager);
 
     // Spawn party HP UI when joining a party that doesn't yet have one.
