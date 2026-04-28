@@ -18,7 +18,7 @@ void __fastcall CUserLocal__Jump_hook(CUserLocal* pThis, void* _EDX, int32_t bEn
     // m_pvc lives at offset +0x0C inside CVecCtrl. Step back 0xC bytes from m_pvc
     // to recover the CVecCtrl base — byte arithmetic so the math doesn't quietly
     // depend on sizeof(IWzVector2D) staying 4 bytes.
-    CVecCtrl* pVecCtrl = reinterpret_cast<CVecCtrl*>(reinterpret_cast<uint8_t*>(pThis->m_pvc) - 0xC);
+    CVecCtrl* pVecCtrl = reinterpret_cast<CVecCtrl*>(reinterpret_cast<uint8_t*>(static_cast<IWzVector2D*>(pThis->m_pvc)) - 0xC);
     // CVecCtrl::GetFoothold(pVecCtrl) || CVecCtrl::GetLadderOrRope(pVecCtrl)
     if (reinterpret_cast<CStaticFoothold*(__thiscall*)(CVecCtrl*)>(0x00639F20)(pVecCtrl) ||
             reinterpret_cast<CLadderOrRope*(__thiscall*)(CVecCtrl*)>(0x004BBE80)(pVecCtrl)) {
