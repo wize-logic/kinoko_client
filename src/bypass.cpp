@@ -8,6 +8,7 @@
 #include "wvs/inputsystem.h"
 #include "wvs/actionman.h"
 #include "wvs/config.h"
+#include "wvs/field.h"
 #include "wvs/stage.h"
 #include "wvs/login.h"
 #include "wvs/clientsocket.h"
@@ -30,6 +31,7 @@ static auto CWvsApp__ctor = 0x009CA8A0;
 
 void __fastcall CWvsApp__ctor_hook(CWvsApp* pThis, void* _EDX, const char* sCmdLine) {
     DEBUG_MESSAGE("CWvsApp::CWvsApp");
+    *reinterpret_cast<uintptr_t*>(pThis) = 0x00BAD460; // vftable: CWvsApp::`vftable'
     CWvsApp::ms_pInstance = pThis;
     pThis->m_hWnd = nullptr;
     pThis->m_bPCOMInitialized = 0;
@@ -97,6 +99,19 @@ void __fastcall CWvsApp__SetUp_hook(CWvsApp* pThis, void* _EDX) {
     srand(timeGetTime());
     // GetSEPrivilege();
     reinterpret_cast<void(__cdecl*)()>(0x0045E030)();
+
+    // ms_aIpAddr table init: copy 0x200 bytes from .text:0x00401234 to .data:0x00C68848,
+    // then overlay 10 dwords at indices 0x40..0x4A with InitSafeDll() returns. The CRC-32
+    // table init that follows in the original SetUp is harmless to drop (only consumed by
+    // CWvsApp::Run, which is wholesale replaced by CWvsApp__Run_hook).
+    memcpy(reinterpret_cast<void*>(0x00C68848), reinterpret_cast<const void*>(0x00401234), 0x200);
+    {
+        auto pTable = reinterpret_cast<uint32_t*>(0x00C68848);
+        auto InitSafeDll = reinterpret_cast<HINSTANCE(__cdecl*)()>(0x0045E2F0);
+        for (int i = 0x40; i < 0x4A; ++i) {
+            pTable[i] = reinterpret_cast<uint32_t>(InitSafeDll());
+        }
+    }
 
     DEBUG_MESSAGE("CWvsApp::SetUp - Initializing...");
     // TSingleton<CConfig>::CreateInstance();
@@ -354,6 +369,72 @@ void __fastcall CWvsContext__OnEnterField_hook(CWvsContext* pThis, void* _EDX) {
     // CTemporaryStatView::Show(&m_temporaryStatView);
     reinterpret_cast<void(__thiscall*)(CTemporaryStatView*)>(0x0075C6A0)(&pThis->m_temporaryStatView);
     pThis->m_bKillMobFromEnterField = 0;
+
+    // CUIRaiseManager::RestoreWindows() — restore minimized/raised quest UI windows
+    // through ZRef<CUIRaiseManager> at this+0x3EA8.
+    auto pUIRaiseManager = *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(pThis) + 0x3EA8);
+    reinterpret_cast<void(__thiscall*)(void*)>(0x0083C5B0)(pUIRaiseManager);
+
+    // Spawn party HP UI when joining a party that doesn't yet have one.
+    if (reinterpret_cast<int32_t(__thiscall*)(CWvsContext*)>(0x0050F430)(pThis) // GetPartyID()
+            && !reinterpret_cast<int32_t(__cdecl*)()>(0x008B7130)()              // !TSingleton<CUIPartyHP>::IsInstantiated()
+            && reinterpret_cast<int32_t(__thiscall*)(CConfig*)>(0x004B3110)(CConfig::GetInstance())) { // CConfig::GetShowPartyHP()
+        // TSingleton<CUIPartyHP>::CreateInstance()
+        reinterpret_cast<void(__cdecl*)()>(0x008D6460)();
+    }
+
+    // Apply pending party-search remocon state captured before the field change.
+    if (pThis->m_bPartyAdvertise_Apply) {
+        pThis->m_bPartyAdvertise_Apply = 0;
+        if (pThis->m_nPartyAdvertise_Mode == 1) {
+            // CWvsContext::ShowPartySearch_Remocon_Searching
+            reinterpret_cast<void(__thiscall*)(CWvsContext*)>(0x009DA9A0)(pThis);
+            // CWvsContext::SendPartyWanted(a, b, c, d)
+            reinterpret_cast<void(__thiscall*)(CWvsContext*, uint32_t, uint32_t, uint32_t, uint32_t)>(0x00A10100)(
+                pThis,
+                pThis->m_anPartyAdvertise[0],
+                pThis->m_anPartyAdvertise[1],
+                pThis->m_anPartyAdvertise[2],
+                pThis->m_anPartyAdvertise[3]);
+        } else if (pThis->m_nPartyAdvertise_Mode == 2) {
+            // CWvsContext::ShowPartySearch_Remocon_Holding
+            reinterpret_cast<void(__thiscall*)(CWvsContext*)>(0x009DAA70)(pThis);
+        }
+    } else {
+        // CWvsContext::StopPartySearch
+        reinterpret_cast<void(__thiscall*)(CWvsContext*)>(0x009D6B80)(pThis);
+    }
+
+    // Restore radio mute level / re-show radio UI when entering a field with the radio playing.
+    if (reinterpret_cast<int32_t(__cdecl*)()>(0x004B2220)()) { // TSingleton<CRadioManager>::IsInstantiated()
+        auto pRadio = reinterpret_cast<void*(__cdecl*)()>(0x004B2210)(); // TSingleton<CRadioManager>::GetInstance()
+        if (reinterpret_cast<int32_t(__thiscall*)(void*)>(0x004B2000)(pRadio)) { // pRadio->IsPlaying()
+            if (pThis->m_bRadio_Restore) {
+                // pRadio->Mute(volume)
+                reinterpret_cast<void(__thiscall*)(void*, int32_t)>(0x006C8840)(pRadio, pThis->m_nRadio_Volume);
+            }
+            // pRadio->ShowUI(1)
+            reinterpret_cast<void(__thiscall*)(void*, int32_t)>(0x006CB870)(pRadio, 1);
+            pThis->m_bRadio_Restore = 0;
+        }
+    }
+
+    // Wild-hunter mount handshake: clear m_nMountKind once we land on a map matching
+    // the requested kind (1 = flying, 2 = swimming).
+    auto pBasicStat = reinterpret_cast<void*(__thiscall*)(CWvsContext*)>(0x004701C0)(pThis);
+    int32_t nJob = reinterpret_cast<int32_t(__thiscall*)(void*)>(0x0047D870)(pBasicStat);
+    if (reinterpret_cast<int32_t(__cdecl*)(int32_t)>(0x004B7CE0)(nJob)) { // is_wildhunter_job
+        if (auto pField = get_field()) {
+            if ((pThis->m_nMountKind == 1 && reinterpret_cast<int32_t(__thiscall*)(CField*)>(0x008DE100)(pField)) ||
+                (pThis->m_nMountKind == 2 && reinterpret_cast<int32_t(__thiscall*)(CField*)>(0x0063A040)(pField))) {
+                pThis->m_nMountKind = 0;
+            }
+        }
+    }
+
+    // CConfig::SaveSessionInfo_FieldID(GetCurFieldID())
+    int32_t nFieldID = reinterpret_cast<int32_t(__thiscall*)(CWvsContext*)>(0x009DB0A0)(pThis);
+    reinterpret_cast<void(__thiscall*)(CConfig*, int32_t)>(0x004B2680)(CConfig::GetInstance(), nFieldID);
 }
 
 
