@@ -114,12 +114,6 @@ compile.bat release-win32
 The launcher creates `MapleStory.exe` suspended, injects `Kinoko.dll` via
 `DetourCreateProcessWithDllExA`, then resumes the main thread.
 
-### Windows 11 note
-
-The launcher sets `__COMPAT_LAYER=WIN7RTM` in its environment before starting
-the child, which suppresses the *Program Compatibility Assistant* dialog that
-otherwise force-closes v95.1 MapleStory on Win10/11.
-
 ---
 
 ## Build configuration flags

@@ -33,7 +33,7 @@ void __fastcall CItemInfo__DrawItemIconForSlot_helper(CItemInfo* pThis, void* _E
             pCanvas->DrawRectangle(x + 1, y - 31, 31, 31, 0xFFBBCCDD);
         }
     }
-    pThis->DrawItemIconForSlot(pCanvas, nItemID, x, y, bProtectedItem, bMag2, bPetDead, bHideCashIcon, nEquipItemQuality, bHideCashIcon, nMagSize);
+    pThis->DrawItemIconForSlot(pCanvas, nItemID, x, y, bProtectedItem, bMag2, bPetDead, bHideCashIcon, nEquipItemQuality, bHideQualityIcon, nMagSize);
     if (nPetIndex == 0) {
         IWzCanvasPtr pBossPetIcon = get_unknown(get_rm()->GetObjectA(L"UI/UIWindow.img/Item/bossPetIcon"));
         pCanvas->CopyEx(x - 1, y - 37, pBossPetIcon, CANVAS_ALPHATYPE::CA_REMOVEALPHA, 0, 0, 0, 0, 0, 0);

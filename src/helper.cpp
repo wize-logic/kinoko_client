@@ -15,6 +15,8 @@ static auto CUserLocal__Jump = reinterpret_cast<void(__thiscall*)(CUserLocal*, i
 
 void __fastcall CUserLocal__Jump_hook(CUserLocal* pThis, void* _EDX, int32_t bEnforced) {
     CUserLocal__Jump(pThis, bEnforced);
+    // m_pvc lives at offset +0x0C inside CVecCtrl. Step back 3 IWzVector2D* slots
+    // (4 bytes each on x86) to recover the CVecCtrl base from the m_pvc pointer.
     CVecCtrl* pVecCtrl = reinterpret_cast<CVecCtrl*>(&static_cast<IWzVector2D*>(pThis->m_pvc)[-3]);
     // CVecCtrl::GetFoothold(pVecCtrl) || CVecCtrl::GetLadderOrRope(pVecCtrl)
     if (reinterpret_cast<CStaticFoothold*(__thiscall*)(CVecCtrl*)>(0x00639F20)(pVecCtrl) ||

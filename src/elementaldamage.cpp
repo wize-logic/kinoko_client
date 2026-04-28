@@ -34,6 +34,9 @@ void __fastcall CWvsContext__ValidateAdditionalItemEffect_hook(CWvsContext* pThi
     }
     int32_t nItemID = pWeapon->nItemID.GetData();
     EQUIPITEM* pEquipItem = CItemInfo::GetInstance()->GetEquipItem(nItemID);
+    if (!pEquipItem) {
+        return;
+    }
 
     // Apply element boost
     auto aElemBoost = pThis->m_pCharacterData->aElemBoost;

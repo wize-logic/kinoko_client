@@ -12,6 +12,9 @@
 #define COOLTIME_OFFSET_HEIGHT 40
 
 
+// All globals below are touched only from the game's main (UI) thread —
+// every hook in this file is invoked from CWvsApp::Run's update path.
+// No synchronization needed unless that assumption ever changes.
 static int g_tLastUpdate = -1;
 static IWzPropertyPtr g_pPropSecond;
 static CTemporaryStatView g_tsvCooltime;
@@ -81,7 +84,10 @@ void __fastcall CWvsContext__SetSkillCooltimeOver_hook(CWvsContext* pThis, void*
         }
     }
     UINT128 uFlag;
-    uFlag.setBitNumber((nSkillID % 127) + 1, 1); // hope for no collisions
+    // Each cooldown entry is keyed by (TSV_SKILL, nSkillID) inside m_lTemporaryStat,
+    // so the per-entry flag bit doesn't need to be unique — every overlay can share bit 1.
+    // (The previous (nSkillID % 127)+1 scheme collided whenever skill IDs were 127 apart.)
+    uFlag.setBitNumber(1, 1);
     g_tsvCooltime.SetTemporary(TSV_SKILL, nSkillID, nRemain, uFlag, ZXString<char>(), 0, 0);
     AdjustPositionWithOffset(&g_tsvCooltime, COOLTIME_OFFSET_HEIGHT);
 }

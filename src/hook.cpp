@@ -43,6 +43,10 @@ void* GetAddress(const char* sModuleName, const char* sProcName) {
     if (!hModule) {
         hModule = LoadLibraryA(sModuleName);
     }
+    if (!hModule) {
+        DEBUG_MESSAGE("Could not load module : %s", sModuleName);
+        return nullptr;
+    }
     FARPROC result = GetProcAddress(hModule, sProcName);
     if (!result) {
         DEBUG_MESSAGE("Could not resolve address for %s in module %s", sProcName, sModuleName);
@@ -63,12 +67,15 @@ bool HexCharToByte(char c, uint8_t* b) {
     return true;
 }
 
-size_t ParsePattern(const char* sPattern, uint8_t* abPattern, uint8_t* abMask) {
+size_t ParsePattern(const char* sPattern, uint8_t* abPattern, uint8_t* abMask, size_t uMax) {
     size_t i = 0;
     while (*sPattern) {
         if (*sPattern == ' ') {
             sPattern++;
             continue;
+        }
+        if (i >= uMax) {
+            return 0; // pattern would overflow caller's buffer
         }
         if (sPattern[0] == '?' && sPattern[1] == '?') {
             abMask[i] = 0x00;
@@ -91,6 +98,10 @@ void* GetAddressByPattern(const char* sModuleName, const char* sPattern) {
     if (!hModule) {
         hModule = LoadLibraryA(sModuleName);
     }
+    if (!hModule) {
+        DEBUG_MESSAGE("Could not load module : %s", sModuleName);
+        return nullptr;
+    }
     MODULEINFO mi;
     if (!GetModuleInformation(GetCurrentProcess(), hModule, &mi, sizeof(mi))) {
         DEBUG_MESSAGE("Could not get module information for : %s", sModuleName);
@@ -101,13 +112,15 @@ void* GetAddressByPattern(const char* sModuleName, const char* sPattern) {
 
     uint8_t abPattern[1024];
     uint8_t abMask[1024];
-    size_t uPatternSize = ParsePattern(sPattern, abPattern, abMask);
-    if (uPatternSize == 0) {
+    size_t uPatternSize = ParsePattern(sPattern, abPattern, abMask, sizeof(abPattern));
+    if (uPatternSize == 0 || uPatternSize > uModuleSize) {
         DEBUG_MESSAGE("Could not parse pattern : %s", sPattern);
         return nullptr;
     }
 
-    for (size_t i = 0; i <= uModuleSize - uPatternSize; ++i) {
+    // i + uPatternSize <= uModuleSize avoids underflow when pattern > module size
+    // and keeps the pattern read inside [pModuleBase, pModuleBase + uModuleSize).
+    for (size_t i = 0; i + uPatternSize <= uModuleSize; ++i) {
         size_t j;
         for (j = 0; j < uPatternSize; ++j) {
             if ((pModuleBase[i + j] & abMask[j]) != (abPattern[j] & abMask[j])) {
@@ -137,6 +150,9 @@ void Patch4(uintptr_t pAddress, uint32_t uValue) {
     VirtualProtect(reinterpret_cast<LPVOID>(pAddress), 4, flOldProtect, &flOldProtect);
 }
 
+// Writes strlen(sValue) bytes — does NOT write a trailing null. Callers pass raw
+// instruction bytes (e.g. "\x33\xC0\xC3") where appending a null would clobber
+// the next opcode, so this is intentional.
 void PatchStr(uintptr_t pAddress, const char* sValue) {
     size_t uSize = strlen(sValue);
     DWORD flOldProtect;

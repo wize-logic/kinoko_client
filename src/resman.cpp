@@ -7,6 +7,7 @@
 #include <windows.h>
 #include <strsafe.h>
 #include <cstdlib>
+#include <iterator>
 
 
 void CWvsApp::InitializeResMan() {
@@ -45,7 +46,7 @@ void CWvsApp::InitializeResMan() {
         root->Mount(L"/", pPackage, 0);
 
         const wchar_t* asNameOrder[] = {L"Character", L"Mob", L"Skill", L"Reactor", L"Npc", L"UI", L"Quest", L"Item", L"Effect", L"String", L"Etc", L"Morph", L"TamingMob", L"Sound", L"Map"};
-        for (size_t i = 0; i < 15; ++i) {
+        for (size_t i = 0; i < std::size(asNameOrder); ++i) {
             ZXString<wchar_t> sPackageName;
             sPackageName.Format(L"%s.wz", asNameOrder[i]);
             IWzPackagePtr pSubPackage;

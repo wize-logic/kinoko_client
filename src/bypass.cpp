@@ -323,10 +323,8 @@ void __fastcall CClientSocket__OnAliveReq_hook(CClientSocket* pThis, void* _EDX,
 static auto CLogin__SendCheckPasswordPacket = 0x005DB9D0;
 
 int32_t __fastcall CLogin__SendCheckPasswordPacket_hook(CLogin* pThis, void* _EDX, char* sID, char* sPasswd) {
-    if (pThis->m_bRequestSent) {
-        return 0;
-    }
-    pThis->m_bRequestSent = 1;
+    // m_bRequestSent is set on first send but the client never clears it on a failed
+    // login response, so a wrong-password retry would silently no-op. Drop the guard.
     pThis->m_WorldItem.RemoveAll();
     pThis->m_aBalloon.RemoveAll();
 

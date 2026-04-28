@@ -25,7 +25,6 @@ HANDLE WINAPI CreateMutexA_hook(LPSECURITY_ATTRIBUTES lpMutexAttributes, BOOL bI
     if (lpName && !strcmp(lpName, "WvsClientMtx")) {
         char sMutex[128];
         sprintf_s(sMutex, 128, "%s-%d", lpName, GetCurrentProcessId());
-        lpName = sMutex;
         AttachClientHooks();
         return CreateMutexA_orig(lpMutexAttributes, bInitialOwner, sMutex);
     }
@@ -111,16 +110,27 @@ LSTATUS WINAPI RegCreateKeyExA_hook(HKEY hKey, LPCSTR lpSubKey, DWORD Reserved, 
 typedef decltype(&WSPStartup) WSPStartup_t;
 static WSPStartup_t WSPStartup_orig = reinterpret_cast<WSPStartup_t>(GetAddress("MSWSOCK", "WSPStartup"));
 static WSPPROC_TABLE g_ProcTable;
-static ULONG g_uNexonAddress;
+static ULONG g_uOriginalAddress;
+static SOCKET g_hRedirectedSocket = INVALID_SOCKET;
 
 int WINAPI WSPConnect_hook(SOCKET s, const struct sockaddr FAR* name, int namelen, LPWSABUF lpCallerData, LPWSABUF lpCalleeData, LPQOS lpSQOS, LPQOS lpGQOS, LPINT lpErrno) {
-    char sName[INET_ADDRSTRLEN];
-    InetNtopA(AF_INET, &((sockaddr_in*)name)->sin_addr, sName, INET_ADDRSTRLEN);
-    if (strstr(sName, CONFIG_NEXON_SEARCH)) {
-        g_uNexonAddress = ((sockaddr_in*)name)->sin_addr.S_un.S_addr;
-        InetPtonA(AF_INET, g_sServerAddress ? g_sServerAddress : CONFIG_SERVER_ADDRESS, &((sockaddr_in*)name)->sin_addr.S_un.S_addr);
+    sockaddr_in* pAddr = reinterpret_cast<sockaddr_in*>(const_cast<sockaddr*>(name));
+    ULONG uAddr = pAddr->sin_addr.S_un.S_addr;
+
+    // Allow-list: loopback (127/8) and the configured target address. Redirect anything else
+    // to g_sServerAddress so this works against any retail address, not just the legacy
+    // 63.251.217.0/24 Nexon range.
+    in_addr targetAddr = {};
+    bool bTargetValid = InetPtonA(AF_INET, g_sServerAddress ? g_sServerAddress : CONFIG_SERVER_ADDRESS, &targetAddr) == 1;
+    bool bIsLoopback = (uAddr & 0xFF) == 0x7F; // first octet 127 in network byte order
+    bool bIsTarget = bTargetValid && uAddr == targetAddr.S_un.S_addr;
+
+    if (bTargetValid && !bIsLoopback && !bIsTarget) {
+        g_uOriginalAddress = uAddr;
+        g_hRedirectedSocket = s;
+        pAddr->sin_addr = targetAddr;
         if (g_nServerPort) {
-            ((sockaddr_in*)name)->sin_port = htons(static_cast<u_short>(g_nServerPort));
+            pAddr->sin_port = htons(static_cast<u_short>(g_nServerPort));
         }
     }
     return g_ProcTable.lpWSPConnect(s, name, namelen, lpCallerData, lpCalleeData, lpSQOS, lpGQOS, lpErrno);
@@ -128,7 +138,11 @@ int WINAPI WSPConnect_hook(SOCKET s, const struct sockaddr FAR* name, int namele
 
 int WINAPI WSPGetPeerName_hook(SOCKET s, struct sockaddr* name, LPINT namelen, LPINT lpErrNo) {
     int result = g_ProcTable.lpWSPGetPeerName(s, name, namelen, lpErrNo);
-    ((sockaddr_in*)name)->sin_addr.S_un.S_addr = g_uNexonAddress;
+    // Only spoof the peer back to the original Nexon address on the socket we actually
+    // redirected — rewriting every socket would corrupt unrelated connections.
+    if (result == 0 && s == g_hRedirectedSocket) {
+        reinterpret_cast<sockaddr_in*>(name)->sin_addr.S_un.S_addr = g_uOriginalAddress;
+    }
     return result;
 }
 

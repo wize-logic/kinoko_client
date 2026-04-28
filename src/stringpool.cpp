@@ -51,6 +51,10 @@ void EncodeString(int nIdx, const char* sSource, char* sDestination) {
 
 
 void AttachStringPoolMod() {
-    REPLACE_STRING(2585, CONFIG_REGISTRY_KEY);
-    REPLACE_STRING(2948, CONFIG_VERSION_STRING);
+    // Indices are positions in StringPool::ms_aString (at 0x00C5A878) for the
+    // v95.1 MapleStory.exe build this client targets, derived from the leaked
+    // v95.1 PDB. There is no runtime detection of pool layout shifts — if the
+    // target binary ever changes, dump the string pool and re-derive these.
+    REPLACE_STRING(2585, CONFIG_REGISTRY_KEY);   // overrides the retail registry key
+    REPLACE_STRING(2948, CONFIG_VERSION_STRING); // overrides the retail version string
 }

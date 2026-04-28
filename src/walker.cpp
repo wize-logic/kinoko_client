@@ -19,7 +19,7 @@ public:
 
 protected:
     virtual void OnOutput(LPCSTR szText) {
-        fprintf_s(m_file, szText);
+        fprintf_s(m_file, "%s", szText);
     }
 };
 
