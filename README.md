@@ -105,11 +105,11 @@ compile.bat release-win32
 3. Pass the server address and port as command-line arguments:
 
    ```bat
-   Kinoko.exe 127.0.0.1 8484
+   Kinoko.exe 172.23.14.184 8484
    ```
 
    With no arguments, Kinoko falls back to the build-time default
-   (`CONFIG_SERVER_ADDRESS` in `src/config.h`, currently `127.0.0.1`).
+   (`CONFIG_SERVER_ADDRESS` in `src/config.h`, currently `172.23.14.184`).
 
 The launcher creates `MapleStory.exe` suspended, injects `Kinoko.dll` via
 `DetourCreateProcessWithDllExA`, then resumes the main thread.

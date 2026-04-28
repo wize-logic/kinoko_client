@@ -3,7 +3,7 @@
 #define CONFIG_WINDOW_NAME    "Kinoko"
 #define CONFIG_DLL_NAME       "Kinoko.dll"
 
-#define CONFIG_SERVER_ADDRESS "127.0.0.1"
+#define CONFIG_SERVER_ADDRESS "172.23.14.184"
 
 #define CONFIG_REGISTRY_KEY     "SOFTWARE\\Kinoko"
 #define CONFIG_VERSION_STRING   "Ver. 95.1"
