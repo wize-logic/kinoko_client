@@ -50,7 +50,14 @@ void ProcessCommandLine() {
     if (!TryParse(sCmdLine, sAddress, nPort) && !TryParse(SkipArgv0(sCmdLine), sAddress, nPort)) {
         return;
     }
-    g_sServerAddress = _strdup(sAddress);
+    // Process-lifetime storage — point g_sServerAddress at a static buffer instead of
+    // _strdup'ing (which leaks for the life of the process). Keep the pointer-based
+    // shape so consumers can still null-check g_sServerAddress to fall back to default.
+    static char s_sAddressBuf[16];
+    if (strcpy_s(s_sAddressBuf, sizeof(s_sAddressBuf), sAddress) != 0) {
+        return;
+    }
+    g_sServerAddress = s_sAddressBuf;
     g_nServerPort = nPort;
 }
 

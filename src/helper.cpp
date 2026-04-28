@@ -15,9 +15,10 @@ static auto CUserLocal__Jump = reinterpret_cast<void(__thiscall*)(CUserLocal*, i
 
 void __fastcall CUserLocal__Jump_hook(CUserLocal* pThis, void* _EDX, int32_t bEnforced) {
     CUserLocal__Jump(pThis, bEnforced);
-    // m_pvc lives at offset +0x0C inside CVecCtrl. Step back 3 IWzVector2D* slots
-    // (4 bytes each on x86) to recover the CVecCtrl base from the m_pvc pointer.
-    CVecCtrl* pVecCtrl = reinterpret_cast<CVecCtrl*>(&static_cast<IWzVector2D*>(pThis->m_pvc)[-3]);
+    // m_pvc lives at offset +0x0C inside CVecCtrl. Step back 0xC bytes from m_pvc
+    // to recover the CVecCtrl base — byte arithmetic so the math doesn't quietly
+    // depend on sizeof(IWzVector2D) staying 4 bytes.
+    CVecCtrl* pVecCtrl = reinterpret_cast<CVecCtrl*>(reinterpret_cast<uint8_t*>(pThis->m_pvc) - 0xC);
     // CVecCtrl::GetFoothold(pVecCtrl) || CVecCtrl::GetLadderOrRope(pVecCtrl)
     if (reinterpret_cast<CStaticFoothold*(__thiscall*)(CVecCtrl*)>(0x00639F20)(pVecCtrl) ||
             reinterpret_cast<CLadderOrRope*(__thiscall*)(CVecCtrl*)>(0x004BBE80)(pVecCtrl)) {
@@ -104,24 +105,24 @@ const char* get_attack_speed_string(int32_t nAttackSpeed) {
     switch (nAttackSpeed) {
     case 0:
     case 1:
-        return " FASTEST";
+        return "FASTEST";
     case 2:
     case 3:
-        return " FASTER";
+        return "FASTER";
     case 4:
     case 5:
-        return " FAST";
+        return "FAST";
     case 6:
-        return " NORMAL";
+        return "NORMAL";
     case 7:
     case 8:
-        return " SLOW";
+        return "SLOW";
     case 9:
     case 10:
-        return " SLOWER";
+        return "SLOWER";
     case 11:
     case 12:
-        return " SLOWEST";
+        return "SLOWEST";
     default:
         return "";
     }

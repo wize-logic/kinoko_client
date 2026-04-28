@@ -56,7 +56,7 @@ void LogStackTrace(PCONTEXT pContextRecord) {
     }
 
     char sTimeInfo[256];
-    strftime(sTimeInfo, MAX_PATH, "%Y-%m-%d %H:%M:%S", &localtime);
+    strftime(sTimeInfo, sizeof(sTimeInfo), "%Y-%m-%d %H:%M:%S", &localtime);
     fprintf_s(file, "================================================================================\n");
     fprintf_s(file, "Stack Trace : %s\n", sTimeInfo);
     fprintf_s(file, "================================================================================\n");

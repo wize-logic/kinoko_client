@@ -15,6 +15,10 @@
 // All globals below are touched only from the game's main (UI) thread —
 // every hook in this file is invoked from CWvsApp::Run's update path.
 // No synchronization needed unless that assumption ever changes.
+//
+// g_tsvCooltime is constructed by C++, so its vptr is the toolchain-emitted one,
+// NOT the game's CTemporaryStatView vftable at 0xBAEC.. — safe today only because
+// nothing we hand g_tsvCooltime to ever dispatches through it virtually.
 static int g_tLastUpdate = -1;
 static IWzPropertyPtr g_pPropSecond;
 static CTemporaryStatView g_tsvCooltime;
@@ -92,10 +96,10 @@ void __fastcall CWvsContext__SetSkillCooltimeOver_hook(CWvsContext* pThis, void*
     AdjustPositionWithOffset(&g_tsvCooltime, COOLTIME_OFFSET_HEIGHT);
 }
 
-static auto CWvsContext__RemoveSkillCooltimeReset = reinterpret_cast<void(__thiscall*)(CWvsContext*, int32_t)>(0x009CCF80);
+static auto CWvsContext__RemoveSkillCooltimeOver = reinterpret_cast<void(__thiscall*)(CWvsContext*, int32_t)>(0x009CCF80);
 
-void __fastcall CWvsContext__RemoveSkillCooltimeReset_hook(CWvsContext* pThis, void* _EDX, int32_t nSkillID) {
-    CWvsContext__RemoveSkillCooltimeReset(pThis, nSkillID);
+void __fastcall CWvsContext__RemoveSkillCooltimeOver_hook(CWvsContext* pThis, void* _EDX, int32_t nSkillID) {
+    CWvsContext__RemoveSkillCooltimeOver(pThis, nSkillID);
     g_tsvCooltime.ResetTemporary(TSV_SKILL, nSkillID);
 }
 
@@ -173,7 +177,7 @@ void AttachTemporaryStatMod() {
     ATTACH_HOOK(CTemporaryStatView__Update, CTemporaryStatView__Update_hook);
     ATTACH_HOOK(CTemporaryStatView__AdjustPosition, CTemporaryStatView__AdjustPosition_hook);
     ATTACH_HOOK(CWvsContext__SetSkillCooltimeOver, CWvsContext__SetSkillCooltimeOver_hook);
-    ATTACH_HOOK(CWvsContext__RemoveSkillCooltimeReset, CWvsContext__RemoveSkillCooltimeReset_hook);
+    ATTACH_HOOK(CWvsContext__RemoveSkillCooltimeOver, CWvsContext__RemoveSkillCooltimeOver_hook);
     ATTACH_HOOK(TEMPORARY_STAT__UpdateShadowIndex, TEMPORARY_STAT__UpdateShadowIndex_hook);
     PatchCall(0x0075DCCC, reinterpret_cast<uintptr_t>(&TEMPORARY_STAT__SetLeft_hook)); // CTemporaryStatView::Update
 }

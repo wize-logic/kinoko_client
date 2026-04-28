@@ -68,12 +68,17 @@ LRESULT WndProc_hook(HWND hWnd, UINT Msg, WPARAM wParam, LPARAM lParam) {
         }
         return 0;
     case WM_NCLBUTTONUP:
-    case WM_LBUTTONUP:
+        // wParam is the NC hit-test code here — HTCLOSE / HTMINBUTTON only make sense
+        // for non-client clicks. WM_LBUTTONUP carries an MK_* mask, never these constants.
         if (wParam == HTCLOSE) {
             PostQuitMessage(0);
         } else if (wParam == HTMINBUTTON && !(GetAsyncKeyState(VK_CONTROL) & 0x8000)) {
             ShowWindow(hWnd, SW_MINIMIZE);
         }
+        bMoving = false;
+        ReleaseCapture();
+        break;
+    case WM_LBUTTONUP:
         bMoving = false;
         ReleaseCapture();
         break;
@@ -111,6 +116,7 @@ typedef decltype(&WSPStartup) WSPStartup_t;
 static WSPStartup_t WSPStartup_orig = reinterpret_cast<WSPStartup_t>(GetAddress("MSWSOCK", "WSPStartup"));
 static WSPPROC_TABLE g_ProcTable;
 static ULONG g_uOriginalAddress;
+static USHORT g_uOriginalPort;
 static SOCKET g_hRedirectedSocket = INVALID_SOCKET;
 
 int WINAPI WSPConnect_hook(SOCKET s, const struct sockaddr FAR* name, int namelen, LPWSABUF lpCallerData, LPWSABUF lpCalleeData, LPQOS lpSQOS, LPQOS lpGQOS, LPINT lpErrno) {
@@ -127,6 +133,7 @@ int WINAPI WSPConnect_hook(SOCKET s, const struct sockaddr FAR* name, int namele
 
     if (bTargetValid && !bIsLoopback && !bIsTarget) {
         g_uOriginalAddress = uAddr;
+        g_uOriginalPort = pAddr->sin_port;
         g_hRedirectedSocket = s;
         pAddr->sin_addr = targetAddr;
         if (g_nServerPort) {
@@ -140,8 +147,12 @@ int WINAPI WSPGetPeerName_hook(SOCKET s, struct sockaddr* name, LPINT namelen, L
     int result = g_ProcTable.lpWSPGetPeerName(s, name, namelen, lpErrNo);
     // Only spoof the peer back to the original Nexon address on the socket we actually
     // redirected — rewriting every socket would corrupt unrelated connections.
+    // Restore both addr and port so callers comparing the peer endpoint can't notice
+    // the rewrite (WSPConnect may have changed sin_port too via g_nServerPort).
     if (result == 0 && s == g_hRedirectedSocket) {
-        reinterpret_cast<sockaddr_in*>(name)->sin_addr.S_un.S_addr = g_uOriginalAddress;
+        auto* pSin = reinterpret_cast<sockaddr_in*>(name);
+        pSin->sin_addr.S_un.S_addr = g_uOriginalAddress;
+        pSin->sin_port = g_uOriginalPort;
     }
     return result;
 }

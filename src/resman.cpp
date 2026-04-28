@@ -72,6 +72,9 @@ void CWvsApp::InitializeResMan() {
             hr = 0x22000004; // EC_NO_DATA_PACAKGE
         }
         // CTerminateException::CTerminateException(&exception, hr);
+        // The static type is ZException so the throw uses ZException's RTTI/dtor —
+        // a normal C++ slice. Safe here because the game's handler dispatches on the
+        // hr field set above, not on RTTI.
         reinterpret_cast<void(__thiscall*)(void*, HRESULT)>(0x00401D50)(&exception, hr);
         throw exception;
     }
@@ -99,9 +102,12 @@ void CWvsApp::Dir_SlashToBackSlash(char* sDir) {
 void CWvsApp::Dir_upDir(char* sDir) {
     size_t uLen = strlen(sDir);
     if (uLen > 0 && sDir[uLen - 1] == '/') {
-        sDir[uLen - 1] = 0;
+        sDir[--uLen] = 0;
     }
-    for (size_t i = strlen(sDir) - 1; i > 0; --i) {
+    if (uLen == 0) {
+        return;
+    }
+    for (size_t i = uLen - 1; i > 0; --i) {
         if (sDir[i] == '/') {
             sDir[i] = 0;
             return;

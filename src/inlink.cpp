@@ -16,7 +16,13 @@ HRESULT __stdcall CWzCanvas__raw_Serialize_hook(IWzCanvas* pThis, IWzArchive* pA
     Ztl_variant_t vInlink = pThis->property->item["_inlink"];
     if (V_VT(&vInlink) == VT_BSTR) {
         ZXString<wchar_t> sFilePath(pArchive->absoluteUOL);
-        sFilePath.ReleaseBuffer(sFilePath.Find(L".img") + 5);
+        // Find returns -1 when ".img" isn't in the path; +5 would then yield
+        // ReleaseBuffer(4), silently truncating to garbage. Bail instead.
+        int32_t nImgPos = sFilePath.Find(L".img");
+        if (nImgPos < 0) {
+            return hr;
+        }
+        sFilePath.ReleaseBuffer(nImgPos + 5);
         sFilePath.Cat(V_BSTR(&vInlink));
         pThis->property->item["_inlink"] = static_cast<const wchar_t*>(sFilePath);
     }

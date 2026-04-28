@@ -138,14 +138,20 @@ void* GetAddressByPattern(const char* sModuleName, const char* sPattern) {
 
 void Patch1(uintptr_t pAddress, uint8_t uValue) {
     DWORD flOldProtect;
-    VirtualProtect(reinterpret_cast<LPVOID>(pAddress), 1, PAGE_EXECUTE_READWRITE, &flOldProtect);
+    if (!VirtualProtect(reinterpret_cast<LPVOID>(pAddress), 1, PAGE_EXECUTE_READWRITE, &flOldProtect)) {
+        DEBUG_MESSAGE("Patch1 VirtualProtect(RWX) failed at 0x%08X : %lu", pAddress, GetLastError());
+        return;
+    }
     *reinterpret_cast<uint8_t*>(pAddress) = uValue;
     VirtualProtect(reinterpret_cast<LPVOID>(pAddress), 1, flOldProtect, &flOldProtect);
 }
 
 void Patch4(uintptr_t pAddress, uint32_t uValue) {
     DWORD flOldProtect;
-    VirtualProtect(reinterpret_cast<LPVOID>(pAddress), 4, PAGE_EXECUTE_READWRITE, &flOldProtect);
+    if (!VirtualProtect(reinterpret_cast<LPVOID>(pAddress), 4, PAGE_EXECUTE_READWRITE, &flOldProtect)) {
+        DEBUG_MESSAGE("Patch4 VirtualProtect(RWX) failed at 0x%08X : %lu", pAddress, GetLastError());
+        return;
+    }
     *reinterpret_cast<uint32_t*>(pAddress) = uValue;
     VirtualProtect(reinterpret_cast<LPVOID>(pAddress), 4, flOldProtect, &flOldProtect);
 }
@@ -156,7 +162,10 @@ void Patch4(uintptr_t pAddress, uint32_t uValue) {
 void PatchStr(uintptr_t pAddress, const char* sValue) {
     size_t uSize = strlen(sValue);
     DWORD flOldProtect;
-    VirtualProtect(reinterpret_cast<LPVOID>(pAddress), uSize, PAGE_EXECUTE_READWRITE, &flOldProtect);
+    if (!VirtualProtect(reinterpret_cast<LPVOID>(pAddress), uSize, PAGE_EXECUTE_READWRITE, &flOldProtect)) {
+        DEBUG_MESSAGE("PatchStr VirtualProtect(RWX) failed at 0x%08X (size %zu) : %lu", pAddress, uSize, GetLastError());
+        return;
+    }
     CopyMemory(reinterpret_cast<PVOID>(pAddress), sValue, uSize);
     VirtualProtect(reinterpret_cast<LPVOID>(pAddress), uSize, flOldProtect, &flOldProtect);
 }
@@ -169,7 +178,10 @@ void PatchJmp(uintptr_t pAddress, uintptr_t pDestination) {
 void PatchNop(uintptr_t pAddress, uintptr_t pDestination) {
     size_t uSize = pDestination - pAddress;
     DWORD flOldProtect;
-    VirtualProtect(reinterpret_cast<LPVOID>(pAddress), uSize, PAGE_EXECUTE_READWRITE, &flOldProtect);
+    if (!VirtualProtect(reinterpret_cast<LPVOID>(pAddress), uSize, PAGE_EXECUTE_READWRITE, &flOldProtect)) {
+        DEBUG_MESSAGE("PatchNop VirtualProtect(RWX) failed at 0x%08X (size %zu) : %lu", pAddress, uSize, GetLastError());
+        return;
+    }
     FillMemory(reinterpret_cast<PVOID>(pAddress), uSize, 0x90);
     VirtualProtect(reinterpret_cast<LPVOID>(pAddress), uSize, flOldProtect, &flOldProtect);
 }
