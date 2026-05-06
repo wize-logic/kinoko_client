@@ -30,13 +30,17 @@ constexpr size_t kCUIMonsterBookSize = 0x18E0;
 //                 — case 9 IS implemented (gates on this+0x3EB4) but the
 //                   slot it gates on is never set in stock v95, so the
 //                   handler always no-ops in practice.
+//   FUN_0076ad50  CWvsContext::RemoveFromStackForTab(CUIWnd*)
+//                 — list-remove from this+0x3DA4. No vtable callbacks,
+//                   safe to invoke from inside a click handler.
 //   DAT_00c6f010  global CUIMonsterBook* singleton — OnMonsterBookSetCard
 //                 / OnMonsterBookSetCover gate on this for null-bail.
-constexpr uintptr_t kCUIWnd_ctor              = 0x008DD680;
-constexpr uintptr_t kCUIWnd_CreateUIWndPosSaved = 0x008DD300;
-constexpr uintptr_t kCWvsContext_UI_Open      = 0x009D83F0;
-constexpr uintptr_t kCWvsContext_UI_Close     = 0x009D5370;
-constexpr uintptr_t kDAT_MonsterBookGlobal    = 0x00C6F010;
+constexpr uintptr_t kCUIWnd_ctor                          = 0x008DD680;
+constexpr uintptr_t kCUIWnd_CreateUIWndPosSaved           = 0x008DD300;
+constexpr uintptr_t kCWvsContext_UI_Open                  = 0x009D83F0;
+constexpr uintptr_t kCWvsContext_UI_Close                 = 0x009D5370;
+constexpr uintptr_t kCWvsContext_RemoveFromStackForTab    = 0x0076AD50;
+constexpr uintptr_t kDAT_MonsterBookGlobal                = 0x00C6F010;
 
 
 // === Mod-side state =========================================================
@@ -55,6 +59,13 @@ namespace {
     // UI_Close's `if-still-open` cleanup can both check the same thing
     // without racing the v95 global.
     void* g_pMonsterBookUI = nullptr;
+
+    // Deferred-destroy slot. UI_Close removes the window from CWvsContext's
+    // draw stack and stashes the buffer here; it's NOT freed inline because
+    // the close X button's click handler is on the call stack at that point
+    // and freeing the buffer (which contains the button) would return into
+    // freed memory. The next UI_Open reaps it before allocating fresh.
+    void* g_pMonsterBookPendingFree = nullptr;
 }
 
 
@@ -216,6 +227,14 @@ static auto CWvsContext__UI_Close = kCWvsContext_UI_Close;
 void __fastcall CWvsContext__UI_Open_hook(void* pThis, void* /*EDX*/,
                                           int nUIType, int nOption) {
     if (nUIType == 9) {  // MONSTERBOOK — case 9 stripped from v95 UI_Open.
+        // Reap any buffer the previous UI_Close deferred. Doing it here, on
+        // a fresh stack, is safe — the close X button's click handler has
+        // long since unwound.
+        if (g_pMonsterBookPendingFree) {
+            void* p = g_pMonsterBookPendingFree;
+            g_pMonsterBookPendingFree = nullptr;
+            MonsterBook_Destroy(p);
+        }
         if (g_pMonsterBookUI == nullptr) {
             void* pBuf = ZAllocEx<ZAllocAnonSelector>::s_Alloc(kCUIMonsterBookSize);
             if (pBuf) {
@@ -237,7 +256,7 @@ void __fastcall CWvsContext__UI_Open_hook(void* pThis, void* /*EDX*/,
         pThis, nUIType, nOption);
 }
 
-void __fastcall CWvsContext__UI_Close_hook(void* pThis, void* /*EDX*/, int nUIType) {
+void __fastcall CWvsContext__UI_Close_hook(void* pCtx, void* /*EDX*/, int nUIType) {
     if (nUIType == 9) {  // MONSTERBOOK
         // X-button → CUIWnd::OnButtonClicked(1000) → CWvsContext::UI_Close(9).
         // v95's case-9 close handler gates on CWvsContext+0x3EB4 which we
@@ -245,15 +264,22 @@ void __fastcall CWvsContext__UI_Close_hook(void* pThis, void* /*EDX*/, int nUITy
         // teardown directly and skip the tail-call.
         if (g_pMonsterBookUI) {
             DEBUG_MESSAGE("CUIMonsterBook close: 0x%08X", g_pMonsterBookUI);
-            void* p = g_pMonsterBookUI;
+            // Take the window OUT of CWvsContext's draw stack so the wnd
+            // manager stops iterating it. Pure list-remove, no callbacks
+            // into the window's vtable — safe to call from the click
+            // handler that's still on the stack above us.
+            reinterpret_cast<void(__thiscall*)(void*, void*)>(
+                kCWvsContext_RemoveFromStackForTab)(pCtx, g_pMonsterBookUI);
+            // Defer the actual buffer free until the next UI_Open. Freeing
+            // here returns into the now-freed close button.
+            g_pMonsterBookPendingFree = g_pMonsterBookUI;
             g_pMonsterBookUI = nullptr;
             g_pV95MonsterBookGlobal = nullptr;
-            MonsterBook_Destroy(p);
         }
         return;
     }
     reinterpret_cast<void(__thiscall*)(void*, int)>(CWvsContext__UI_Close)(
-        pThis, nUIType);
+        pCtx, nUIType);
 }
 
 
