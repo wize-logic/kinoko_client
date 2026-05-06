@@ -5,7 +5,6 @@
 #include "wvs/uimonsterbook.h"
 #include "wvs/ctrlwnd.h"
 #include "wvs/wnd.h"
-#include "wvs/wndman.h"
 
 #include <cstring>
 
@@ -31,27 +30,26 @@ constexpr size_t kCUIMonsterBookSize = 0x18E0;
 //                 — case 9 IS implemented (gates on this+0x3EB4) but the
 //                   slot it gates on is never set in stock v95, so the
 //                   handler always no-ops in practice.
-//   FUN_008dd380  CUIWnd::OnDestroy — actually a position-save helper,
-//                 not a list-removal. Reads +0xAF9 sentinel. Calling it
-//                 alone leaves the window in the wnd-manager lists, so
-//                 it stays drawn after click-X. Kept here for reference.
-//   FUN_009b30c0  CWndMan::RemoveWindow(CWnd*) — static.
-//   FUN_009b30f0  CWndMan::RemoveUpdateWindow(CWnd*) — static.
-//   FUN_009b3120  CWndMan::RemoveInvalidatedWindow(CWnd*) — static.
-//   FUN_009b3180  CWndMan::UnregisterUIWindow(CUIWnd*) — instance method.
-//   These four are the canonical list-removal sequence (FUN_009b0e50
-//   calls them as the close-time prefs-save tail). After running them
-//   the wnd manager stops drawing the window.
+//   CWvsContext+0x3EB4  the per-UI window pointer slot for case 9
+//                 (canonical close mechanism — every CUIWnd lives in a
+//                 ZRef-style 8-byte slot in CWvsContext at +0x3E30+8*N;
+//                 case 9's slot is at +0x3EB0/+0x3EB4). v95 UI_Close
+//                 reads this, fires FUN_009d1ae0 to clear it, which
+//                 Releases the window — refcount→0, virtual dtor runs,
+//                 ~CUIWnd → ~CWnd unregisters from wnd-manager. v95
+//                 stripped only the OPEN-side population of this slot,
+//                 not the close path. Confirmed via case-9 close asm at
+//                 0x009D5681: `mov ecx,[esi+0x3eb4]; test ecx,ecx; jz
+//                 break_path; call FUN_009b0e50; push 0; lea ecx,
+//                 [esi+0x3eb0]; call FUN_009d1ae0`.
 //   DAT_00c6f010  global CUIMonsterBook* singleton — OnMonsterBookSetCard
 //                 / OnMonsterBookSetCover gate on this for null-bail.
 constexpr uintptr_t kCUIWnd_ctor                          = 0x008DD680;
 constexpr uintptr_t kCUIWnd_CreateUIWndPosSaved           = 0x008DD300;
-constexpr uintptr_t kCWndMan_RemoveWindow                 = 0x009B30C0;
-constexpr uintptr_t kCWndMan_RemoveUpdateWindow           = 0x009B30F0;
-constexpr uintptr_t kCWndMan_RemoveInvalidatedWindow      = 0x009B3120;
-constexpr uintptr_t kCWndMan_UnregisterUIWindow           = 0x009B3180;
 constexpr uintptr_t kCWvsContext_UI_Open                  = 0x009D83F0;
 constexpr uintptr_t kCWvsContext_UI_Close                 = 0x009D5370;
+constexpr uintptr_t kCWvsContext_MonsterBookSlotPtr_Off   = 0x3EB4;
+constexpr uintptr_t kZRefCounted_RefField_Off             = 0xC;
 constexpr uintptr_t kDAT_MonsterBookGlobal                = 0x00C6F010;
 
 
@@ -67,17 +65,10 @@ namespace {
     void*& g_pV95MonsterBookGlobal =
         *reinterpret_cast<void**>(kDAT_MonsterBookGlobal);
 
-    // Local sentinel so UI_Open's `if-already-open` short-circuit and
-    // UI_Close's `if-still-open` cleanup can both check the same thing
-    // without racing the v95 global.
+    // Local mirror of the v95 slot pointer for debug-log convenience —
+    // UI_Open's "already open" gate reads the slot directly so this is
+    // just a friendly handle for the close-side log line.
     void* g_pMonsterBookUI = nullptr;
-
-    // Deferred-destroy slot. UI_Close removes the window from CWvsContext's
-    // draw stack and stashes the buffer here; it's NOT freed inline because
-    // the close X button's click handler is on the call stack at that point
-    // and freeing the buffer (which contains the button) would return into
-    // freed memory. The next UI_Open reaps it before allocating fresh.
-    void* g_pMonsterBookPendingFree = nullptr;
 }
 
 
@@ -236,66 +227,59 @@ static void MonsterBook_Destroy(void* pThis) {
 static auto CWvsContext__UI_Open = kCWvsContext_UI_Open;
 static auto CWvsContext__UI_Close = kCWvsContext_UI_Close;
 
-void __fastcall CWvsContext__UI_Open_hook(void* pThis, void* /*EDX*/,
+void __fastcall CWvsContext__UI_Open_hook(void* pCtx, void* /*EDX*/,
                                           int nUIType, int nOption) {
     if (nUIType == 9) {  // MONSTERBOOK — case 9 stripped from v95 UI_Open.
-        // Reap any buffer the previous UI_Close deferred. Doing it here, on
-        // a fresh stack, is safe — the close X button's click handler has
-        // long since unwound.
-        if (g_pMonsterBookPendingFree) {
-            void* p = g_pMonsterBookPendingFree;
-            g_pMonsterBookPendingFree = nullptr;
-            MonsterBook_Destroy(p);
+        auto** pSlot = reinterpret_cast<void**>(
+            static_cast<uint8_t*>(pCtx) + kCWvsContext_MonsterBookSlotPtr_Off);
+        if (*pSlot != nullptr) {
+            // Slot still set — window is already open. v95's other cases
+            // gate the same way; matching the convention.
+            return;
         }
-        if (g_pMonsterBookUI == nullptr) {
-            void* pBuf = ZAllocEx<ZAllocAnonSelector>::s_Alloc(kCUIMonsterBookSize);
-            if (pBuf) {
-                std::memset(pBuf, 0, kCUIMonsterBookSize);
-                MonsterBook_Construct(pBuf);
-                g_pMonsterBookUI = pBuf;
-                g_pV95MonsterBookGlobal = pBuf;
-                DEBUG_MESSAGE("CUIMonsterBook open: 0x%08X", pBuf);
-            } else {
-                DEBUG_MESSAGE("CUIMonsterBook s_Alloc(0x%X) failed",
-                              static_cast<unsigned>(kCUIMonsterBookSize));
-            }
+        void* pBuf = ZAllocEx<ZAllocAnonSelector>::s_Alloc(kCUIMonsterBookSize);
+        if (!pBuf) {
+            DEBUG_MESSAGE("CUIMonsterBook s_Alloc(0x%X) failed",
+                          static_cast<unsigned>(kCUIMonsterBookSize));
+            return;
         }
-        // Window already open; clicking the hotkey again is a no-op (matches
-        // v95 cases that gate on `if (m_pUIxxx == 0)`).
+        std::memset(pBuf, 0, kCUIMonsterBookSize);
+        MonsterBook_Construct(pBuf);
+
+        // Hook the window into v95's canonical close machinery: bump the
+        // ZRefCounted refcount to 1 (mirroring what FUN_009d1750 / sibling
+        // setters do for non-stripped cases) then write the pointer into
+        // the case-9 slot at CWvsContext+0x3EB4. v95's stock UI_Close
+        // case 9 will read this slot, run FUN_009b0e50 (no-op for us
+        // since m_dwWndKey stays 0) and FUN_009d1ae0 to clear the slot.
+        // The slot-clear decrements our refcount back to 0 and fires the
+        // virtual dtor through the v95-stamped vtable, which removes the
+        // window from the wnd manager and frees the buffer.
+        InterlockedIncrement(reinterpret_cast<volatile LONG*>(
+            static_cast<uint8_t*>(pBuf) + kZRefCounted_RefField_Off));
+        *pSlot = pBuf;
+        g_pV95MonsterBookGlobal = pBuf;
+        g_pMonsterBookUI = pBuf;
+        DEBUG_MESSAGE("CUIMonsterBook open: 0x%08X", pBuf);
         return;
     }
     reinterpret_cast<void(__thiscall*)(void*, int, int)>(CWvsContext__UI_Open)(
-        pThis, nUIType, nOption);
+        pCtx, nUIType, nOption);
 }
 
 void __fastcall CWvsContext__UI_Close_hook(void* pCtx, void* /*EDX*/, int nUIType) {
     if (nUIType == 9) {  // MONSTERBOOK
-        // KNOWN LIMITATION (Phase 2-port-1.1): clicking the close X fires
-        // CUIWnd::OnButtonClicked(1000) -> CWvsContext::UI_Close(9), which
-        // lands here with the click handler still on the stack. None of
-        // the candidate teardown sequences we've tried hide the window
-        // visually:
-        //   - CUIWnd::OnDestroy (0x008DD380): position-save helper, not
-        //     a wnd-manager unregister.
-        //   - CWndMan::RemoveWindow / RemoveUpdate / RemoveInvalidated /
-        //     UnregisterUIWindow (the FUN_009b0e50 tail sequence): no-op
-        //     for us because the find-by-CWnd-pointer step doesn't locate
-        //     us — the window was never registered in those lists.
-        //   - Synchronous ZAllocEx::s_Free: returns into the freed close
-        //     button, ACCESS_VIOLATION reading a corrupt vtable.
-        // Net: stock v95 hides UIs through the deferred-Release path on
-        // their CWvsContext per-UI ZRef slot, which never got allocated
-        // for case 9 (the slot at CWvsContext+0x3EB4 is dead in v95).
-        // Reproducing that path requires either porting the per-UI ZRef
-        // setup (and the matching Release queue), or finding the actual
-        // wnd-manager list our window sits in to remove from.
-        //
-        // Until that's understood: do nothing on close. The window stays
-        // visible after click-X; subsequent /book is a no-op (the global
-        // is still set). Logout clears the singleton naturally. This
-        // keeps us crash-free while the next slice (CreateLayer) lands.
-        return;
+        DEBUG_MESSAGE("CUIMonsterBook close: 0x%08X", g_pMonsterBookUI);
+        // Clear DAT_00c6f010 BEFORE the slot-clear runs the dtor — once
+        // the buffer is freed, OnMonsterBookSetCard / SetCover would
+        // deref freed memory if the global still pointed at it. Local
+        // sentinel cleared too so the next /book sees a clean state.
+        g_pV95MonsterBookGlobal = nullptr;
+        g_pMonsterBookUI = nullptr;
     }
+    // Tail-call: v95's case-9 close reads the slot we populated, runs
+    // FUN_009b0e50 + FUN_009d1ae0, fires Release → virtual dtor → ~CUIWnd
+    // → ~CWnd unregisters from the wnd manager. The window vanishes.
     reinterpret_cast<void(__thiscall*)(void*, int)>(CWvsContext__UI_Close)(
         pCtx, nUIType);
 }
