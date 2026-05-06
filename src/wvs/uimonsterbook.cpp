@@ -199,25 +199,13 @@ static void MonsterBook_CreateLayer(void* pThis) {
     }
     g_pMonsterBookLayoutMan->Init(reinterpret_cast<CWnd*>(pThis), 0, 0);
 
-    // === Diagnostic A: probe the WZ resolver directly =====================
-    // PcCreateObject is what KMST's CreateLayer uses to load static
-    // canvases. If the UOL resolves, we get a non-null IWzCanvas. If it
-    // doesn't, the path itself is wrong (different namespace / archive
-    // alias / etc).
-    IWzCanvasPtr pBgCanvas;
-    PcCreateObject(L"UI/UIWindow.img/MonsterBook/backgrnd",
-                   pBgCanvas, nullptr);
-    DEBUG_MESSAGE("  PcCreateObject(canvas backgrnd) raw=0x%08X",
-                  *reinterpret_cast<void**>(&pBgCanvas));
-
-    // === Diagnostic B: AddSingleLayer on a known-Property UOL =============
+    // === Diagnostic: AddSingleLayer on a known-Property UOL ================
     // BtClose is the path our visible close-X button uses, so we know the
     // archive + path resolve correctly. If AddSingleLayer succeeds on
     // this Property but fails on the backgrnd Canvas, the loader expects
-    // a Property root (sub-canvases for frames) and a single-Canvas leaf
-    // can't be wrapped as a layer through this path. Different workaround
-    // needed for true static canvases (likely PcCreateObject + manual
-    // IWzGr2DLayer::InsertCanvas like KMST).
+    // a Property root with sub-canvases (animation frames or button
+    // states) and a single-Canvas leaf can't be wrapped as a layer
+    // through this path. Different workaround needed.
     IWzGr2DLayerPtr btCloseLayer;
     reinterpret_cast<IWzGr2DLayerPtr*(__thiscall*)(CLayoutMan*, IWzGr2DLayerPtr*, const wchar_t*, int32_t, int32_t)>(
         0x005CDCB0)(g_pMonsterBookLayoutMan, std::addressof(btCloseLayer),
@@ -225,7 +213,7 @@ static void MonsterBook_CreateLayer(void* pThis) {
     DEBUG_MESSAGE("  AddSingleLayer(\"BtClose\" Property) raw=0x%08X",
                   *reinterpret_cast<void**>(&btCloseLayer));
 
-    // === Diagnostic C: original AddSingleLayer for the bg ================
+    // Original AddSingleLayer for the bg.
     IWzGr2DLayerPtr layer;
     reinterpret_cast<IWzGr2DLayerPtr*(__thiscall*)(CLayoutMan*, IWzGr2DLayerPtr*, const wchar_t*, int32_t, int32_t)>(
         0x005CDCB0)(g_pMonsterBookLayoutMan, std::addressof(layer),
