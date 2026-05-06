@@ -359,6 +359,44 @@ static void MonsterBook_CreateLayer(void* pThis) {
     }
 
     DEBUG_MESSAGE("MonsterBook_CreateLayer: all 3 layers built ok");
+
+    // ----- Background canvas ----------------------------------------------
+    //
+    // The 3 sub-layers above are foreground content (LeftLayer / RightLayer
+    // / SelectLayer per KMST CUIMonsterBook::Update at 0x847FF0). They have
+    // empty backing canvases that DrawLeftLayer / DrawRightLayer /
+    // DrawSelectLayer would normally fill on demand — but those Draw* are
+    // stripped from v95, so the empty canvases stay transparent, and the
+    // parent layer behind them stays empty too. Result: nothing visible.
+    //
+    // Quickest path to a visible window: load the WZ-side bg canvas
+    // (UI/UIWindow.img/MonsterBook/backgrnd) and insert it into the parent
+    // layer. This puts the bg at parent.z (=10 in the test logs) — under
+    // our sub-layers at z=11/12, so the foreground draws on top correctly
+    // once the Draw* ports land. Pattern lifted verbatim from
+    // temporarystat.cpp:135 + 161 (get_unknown(get_rm()->GetObjectA(UOL))
+    // → InsertCanvas).
+    //
+    // PreDestroy doesn't need to RemoveCanvas explicitly — when the wnd's
+    // dtor runs, ~CWnd Releases the parent layer which transitively
+    // releases its inserted canvases. We never AddRef the bg manually so
+    // there's no extra ref to balance.
+    DEBUG_MESSAGE("MonsterBook_CreateLayer: loading bg canvas");
+    try {
+        IWzCanvasPtr pBgCanvas = get_unknown(get_rm()->GetObjectA(
+            Ztl_bstr_t(L"UI/UIWindow.img/MonsterBook/backgrnd")));
+        if (!pBgCanvas) {
+            DEBUG_MESSAGE("  bg canvas resolved to NULL — UOL missing or QI failed");
+        } else {
+            DEBUG_MESSAGE("  bg canvas resolved: pBgCanvas=0x%08X",
+                          pBgCanvas.GetInterfacePtr());
+            pParentLayer->InsertCanvas(pBgCanvas);
+            DEBUG_MESSAGE("  bg canvas inserted into parent layer");
+        }
+    } catch (const _com_error& e) {
+        DEBUG_MESSAGE("  bg-canvas load/insert threw HRESULT 0x%08X (%s)",
+                      static_cast<unsigned>(e.Error()), e.ErrorMessage());
+    }
 }
 
 // KMST 0x0084988E (32 lines) — tools/decomp/cache_kmst/0084988e.c.
