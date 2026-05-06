@@ -383,15 +383,65 @@ static void MonsterBook_CreateLayer(void* pThis) {
     // there's no extra ref to balance.
     DEBUG_MESSAGE("MonsterBook_CreateLayer: loading bg canvas");
     try {
+        // Step A: Resolve the WZ canvas and probe its dims. If the resolve
+        // succeeded the canvas should have non-zero width/height; zero
+        // dims would mean the WZ entry is degenerate / not a real canvas.
         IWzCanvasPtr pBgCanvas = get_unknown(get_rm()->GetObjectA(
             Ztl_bstr_t(L"UI/UIWindow.img/MonsterBook/backgrnd")));
         if (!pBgCanvas) {
             DEBUG_MESSAGE("  bg canvas resolved to NULL — UOL missing or QI failed");
         } else {
-            DEBUG_MESSAGE("  bg canvas resolved: pBgCanvas=0x%08X",
-                          pBgCanvas.GetInterfacePtr());
+            DEBUG_MESSAGE("  bg canvas resolved: pBgCanvas=0x%08X w=%lu h=%lu cx=%ld cy=%ld",
+                          pBgCanvas.GetInterfacePtr(),
+                          static_cast<unsigned long>(pBgCanvas->width),
+                          static_cast<unsigned long>(pBgCanvas->height),
+                          static_cast<long>(pBgCanvas->cx),
+                          static_cast<long>(pBgCanvas->cy));
+
+            // Step B: Probe the parent layer's visibility — if it's hidden
+            // for any reason no inserted canvas will appear.
+            DEBUG_MESSAGE("  parentLayer visible=%ld z=%ld color=0x%08lX",
+                          static_cast<long>(pParentLayer->visible),
+                          static_cast<long>(pParentLayer->z),
+                          static_cast<unsigned long>(pParentLayer->color));
+
+            // Step C: InsertCanvas direct reference into the parent layer.
+            // KMST's pattern would have CUIWnd's bg-canvas mechanism handle
+            // this via m_sBackgrndUOL, but that path didn't draw in the
+            // previous session's experiments so we mirror the
+            // temporarystat.cpp approach instead.
             pParentLayer->InsertCanvas(pBgCanvas);
-            DEBUG_MESSAGE("  bg canvas inserted into parent layer");
+            DEBUG_MESSAGE("  bg canvas inserted into parent layer (direct ref)");
+
+            // Step D: ALSO copy the bg pixels into LAYER[0]'s canvas as a
+            // defensive backup — temporarystat.cpp does the Copy-into-fresh
+            // pattern for its skill cooldown shadows. If the parent-layer
+            // insert above doesn't render (for whatever wnd-internal
+            // reason), the LAYER[0] copy will at least produce visible
+            // pixels in the (40, 25)..(214, 281) rect.
+            //
+            // We pick LAYER[0]'s slot (+0x15A4) since it's the LeftLayer
+            // and its canvas is 174x256 — fits inside the bg's expected
+            // 475x349 footprint when the bg is cropped to the layer's
+            // origin offset of (40, 25). The bg covers the WHOLE wnd so
+            // copying its top-left 174x256 region gives us the upper-left
+            // chunk of the bg art.
+            auto** pSlot = reinterpret_cast<IWzGr2DLayer**>(
+                pBytes + 0x15A4);
+            if (*pSlot != nullptr) {
+                // Look up the canvas attached to LAYER[0]. We Created it
+                // empty earlier; now Copy() the bg pixels into it.
+                IWzGr2DLayerPtr pL0(*pSlot, /*fAddRef=*/true);
+                IWzCanvasPtr pL0Canvas = pL0->canvas[0L];
+                if (pL0Canvas) {
+                    DEBUG_MESSAGE("  L0 canvas at index 0: 0x%08X",
+                                  pL0Canvas.GetInterfacePtr());
+                    pL0Canvas->Copy(0, 0, pBgCanvas);
+                    DEBUG_MESSAGE("  L0 canvas Copy(0,0,bg) ok");
+                } else {
+                    DEBUG_MESSAGE("  L0 canvas at index 0 is NULL");
+                }
+            }
         }
     } catch (const _com_error& e) {
         DEBUG_MESSAGE("  bg-canvas load/insert threw HRESULT 0x%08X (%s)",
