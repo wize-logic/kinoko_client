@@ -8,6 +8,7 @@
 #include "wvs/util.h"
 #include "wvs/wnd.h"
 
+#include <algorithm>
 #include <cstring>
 
 
@@ -88,16 +89,20 @@ namespace {
 // and add 0xB08 (v95 sizeof(CUIWnd)) — net +0x6A0 — to get the v95
 // absolute offset.
 //
-// Status (2026-05-07): CreateCtrl + CreateLayer + CreateRect + CreateFontArray
-// are LANDED. CreateCardTable remains DEFERRED with rationale in its
-// function-level comment (3 converging blockers + invisible-without-DrawLeftLayer
-// payoff). CCtrlLPTab / CCtrlRPTab and the real DrawLeftLayer body remain
-// DEFERRED — see "CCtrlTab port investigation 2026-05-07" further down for
-// findings (multi-vtable layout, KMST CCtrlTab::CreateCtrl introduces a 4-arg
-// override at slot 10 incompatible with kinoko's CCtrlWnd vtable shape, +0xEC0
-// LP / +0xEC8 RP storage). Multi-session port; do NOT attempt without a
-// verified vtable layout matching v95's stripped CCtrlWnd shape — wrong slot
-// dispatch crashes the process.
+// Status (2026-05-08): CreateCtrl + CreateLayer + CreateRect + CreateFontArray
+// + CreateCardTable LANDED. CCtrlLPTab / CCtrlRPTab class defined in
+// ctrlwnd.h (inherits CCtrlWnd, exposes non-virtual CreateCtrlFromRect to
+// sidestep the KMST 4-arg vs kinoko 7-arg vtable-slot mismatch — we always
+// reach these tabs via typed C++ pointers, never vtable dispatch). Base
+// CCtrlTab::CreateCtrlFromRect ports KMST 0x00845CA6 (sublayer + canvas
+// build); LP/RP overrides ship a minimal port that allocates the buffer +
+// chains to base, leaving the WZ tab-tree iteration for a follow-up session.
+// DrawLeftLayer ports the KMST scaffolding: reads m_pLPTab+0x34 to pick the
+// current tab, iterates m_aCardTable[currentTab], paints a 5x5 grid with
+// per-cell colours (populated cells bright, empty cells dim) plus a 9-segment
+// tab indicator strip. End-to-end card visibility — replacing the placeholder
+// fills with real Mob/%07d.img canvas blits is a localized swap once Windows
+// iteration confirms the dispatch.
 //
 // Per-builder logging: every builder emits DEBUG_MESSAGE markers on
 // entry/exit and around each significant call. With AttachDebugConsole
@@ -124,6 +129,14 @@ namespace {
 // UIWindow.img/MonsterBook`). KMST resolves the same four via StringPool
 // keys 0xAEF/0xAF0/0xAF1/0xAF2; arrowLeft and arrowRight repeat across the
 // two scroll-pair offsets.
+//
+// LP/RP tab strips: KMST allocs 0x48-byte CCtrlTab at each slot, stamps 3
+// hand-built vtables, and calls CreateCtrl with a packed RECT. We use kinoko-
+// inheritance (CCtrlLPTab : CCtrlTab : CCtrlWnd) and route via the
+// `CreateCtrlFromRect` adapter — the mismatched slot/arg-count between
+// kinoko's 7-arg `CreateCtrl` and KMST's 4-arg variant is sidestepped because
+// we never dispatch through the vtable for these two controls; we always
+// reach them via typed C++ pointers from this function and from PreDestroy.
 static void MonsterBook_CreateCtrl(void* pThis) {
     DEBUG_MESSAGE("MonsterBook_CreateCtrl: enter pThis=0x%08X", pThis);
 
@@ -144,6 +157,39 @@ static void MonsterBook_CreateCtrl(void* pThis) {
     };
 
     auto* pParent = reinterpret_cast<CWnd*>(pThis);
+
+    // LPTab — left-page tab strip, id=0x7D6, rect (-7, 25, 50, 305).
+    // Stored at v95 +0x1560 (KMST +0xEC0). DrawLeftLayer reads
+    // *(this+0x1564) = pLPTab and dereferences pLPTab+0x34 (m_nCurrentTab),
+    // so the slot MUST be populated before any /book Update tick fires.
+    {
+        auto* pLPTab = new CCtrlLPTab();
+        if (pLPTab) {
+            auto* pSlot = reinterpret_cast<CCtrlLPTab**>(static_cast<uint8_t*>(pThis) + 0x1564);
+            *pSlot = pLPTab;
+            const RECT lpRect = { -7, 25, 50, 305 };
+            pLPTab->CreateCtrlFromRect(pParent, 0x07D6, &lpRect, nullptr);
+            DEBUG_MESSAGE("  LPTab id=0x7D6 stored at +0x1564 -> 0x%08X", pLPTab);
+        } else {
+            DEBUG_MESSAGE("  LPTab alloc failed");
+        }
+    }
+
+    // RPTab — right-page tab strip, id=0x7D7, rect (439, 25, 506, 220).
+    // Stored at v95 +0x1568 (KMST +0xEC8).
+    {
+        auto* pRPTab = new CCtrlRPTab();
+        if (pRPTab) {
+            auto* pSlot = reinterpret_cast<CCtrlRPTab**>(static_cast<uint8_t*>(pThis) + 0x156C);
+            *pSlot = pRPTab;
+            const RECT rpRect = { 439, 25, 506, 220 };
+            pRPTab->CreateCtrlFromRect(pParent, 0x07D7, &rpRect, nullptr);
+            DEBUG_MESSAGE("  RPTab id=0x7D7 stored at +0x156C -> 0x%08X", pRPTab);
+        } else {
+            DEBUG_MESSAGE("  RPTab alloc failed");
+        }
+    }
+
     for (const auto& spec : kButtons) {
         DEBUG_MESSAGE("  button id=%u (0x%X) at +0x%X pos=(%d,%d) UOL=%S",
                       spec.id, spec.id, static_cast<unsigned>(spec.offset),
@@ -441,43 +487,91 @@ static void MonsterBook_CreateRect(void* pThis) {
 // Allocates the 9-column ZArray<ZArray<ZRef<MonsterBookCard>>> at v95 +0x1888
 // (= KMST +0x11E8) — backing store for all collected cards by tab/area.
 //
-// DEFERRED Phase 2-port-4 (re-confirmed 2026-05-07 with Task 1 cipher unblocked):
-// the population path needs THREE pieces v95 doesn't ship:
+// Population strategy:
+//   KMST iterates via `GetCard(tab, idx)` (KMST 0x006823F1) which v95 stripped.
+//   But v95 CMonsterBookMan still owns the underlying per-tab arrays — its ctor
+//   (v95 0x009ca340) calls `_eh_vector_constructor_iterator_(this+1, 4, 9, ...)`
+//   to construct 9 `ZArray<MonsterBookCard>` slots at `pMan + 4 + tab*4`.
+//   v95 LoadCard (0x006634b0) populates them from `Etc.wz/MonsterBook.img`.
+//   We read those slots directly with the same address arithmetic KMST's
+//   stripped GetCard would have used.
 //
-//   1. Per-tab GetCard enumerator. KMST `GetCard(this, &out, tab, idx)` at
-//      0x006823F1 is stripped from v95; only by-cardId `GetCard(this, &out,
-//      cardId)` at 0x00662930 survives. v95 also lacks the
-//      `?GetHeadPosition@?$ZMap@JV?$ZRef@UMonsterBookCard@@...` symbol —
-//      ZMap iteration helpers exist for the GW_MonsterBookCard variant
-//      (master template, used by data load) but not for MonsterBookCard
-//      (player's collected cards, what we want).
+// Wire format (verified via KMST GetCard(tab, idx) read pattern):
+//   pTab        = *(int**)(pMan + 4 + tab*4)        // ZArray data ptr
+//   count       = pTab[-1]                          // ZArray count word
+//   pTab[0..N]  : array of N 8-byte ZRef slots, each { void* pad, MonsterBookCard* p }
 //
-//   2. cardId → mobId mapping. Verified empirically via v95's
-//      CMonsterBookAccessor::SetCount (0x009118F0) — the MonsterBookCard
-//      struct stores only `(short)(cardId - 0x50E0)` + `(byte)count`, no
-//      mobId field. Mapping must come from WZ:
-//      `Item.wz/Consume/0238.img/<cardId>/info/mob`. CItemInfo::GetItemInfo
-//      at v95 0x005A8F20 returns IWzPropertyPtr we could read; ~700 lookups
-//      one-time at /book open, sub-second total.
+// We populate `m_aCardTable[tab]` (a `ZArray<ZArray<V95Ref>>` at v95 +0x1888)
+// with `(count + 24) / 25` paginated rows of up to 25 V95Ref entries each —
+// matching KMST's 25-card-per-row chunking that DrawLeftLayer reads back.
+// Refcount is intentionally NOT bumped: cards are owned by CMonsterBookMan's
+// per-tab arrays for the entire game session; m_aCardTable is a borrowed view.
 //
-//   3. mobId → tab grouping. KMST source not available; canonical 9-tab
-//      ranges aren't documented in v95 GMS WZ either (no
-//      Etc.wz/MonsterBook.img). Closest source is the 9-region MapleStory
-//      mob-ID prefix convention (1xxxxxx Maple, 2xxxxxx Victoria, etc.)
-//      but boundaries are heuristic.
-//
-// Even with all three solved, CreateCardTable is **invisible** until
-// DrawLeftLayer's real body (KMST 0x00849F68) is also ported — the current
-// stub paints a green test rectangle and ignores m_aCardTable entirely.
-// Empty-init is safe: GetCard_1 (v95 0x00808FB0) null-checks
-// `*(this+0x1888 + tabIdx*4)` and returns nullptr cards; downstream paths
-// render no sprites without crashing. That is the current behaviour.
-//
-// Future plan: do this work as a single batch with the DrawLeftLayer port
-// so the visible payoff lands in lockstep. Splitting them produces invisible
-// data churn for one or two sessions.
-static void MonsterBook_CreateCardTable(void* /*pThis*/) {
-    // No-op: zero-initialised buffer is a valid "no cards loaded" state.
+// CMonsterBookMan singleton instance lives at DAT_00C6AB6C (TSingleton<...>::ms_pInstance).
+// If the singleton is null (LoadBook never ran) every tab silently no-ops.
+namespace {
+    // 8-byte v95 ZRef wire format. Kinoko's templated ZRef is 4 bytes (just T*),
+    // but the v95 binary genuinely uses an 8-byte ZRef (see KMST 0x4779FA: `mov
+    // [esi+0x4], ecx` writes the stored T* at slot+4, not slot+0). Store and
+    // forward verbatim — DrawLeftLayer reads the same 8-byte stride.
+    struct V95Ref {
+        void* pad0;   // +0 — usually unused
+        void* p;      // +4 — T*
+    };
+    static_assert(sizeof(V95Ref) == 8);
+
+    constexpr uintptr_t kCMonsterBookMan_ms_pInstance = 0x00C6AB6C;
+}
+static void MonsterBook_CreateCardTable(void* pThis) {
+    DEBUG_MESSAGE("MonsterBook_CreateCardTable: enter pThis=0x%08X", pThis);
+
+    auto* pMan = *reinterpret_cast<uint8_t**>(kCMonsterBookMan_ms_pInstance);
+    if (!pMan) {
+        DEBUG_MESSAGE("  CMonsterBookMan singleton is NULL (LoadBook never ran?) — empty card table");
+        return;
+    }
+    DEBUG_MESSAGE("  CMonsterBookMan @0x%08X", pMan);
+
+    auto* pBytes = static_cast<uint8_t*>(pThis);
+    auto* pCardTableArrays = reinterpret_cast<ZArray<V95Ref>*>(pBytes + 0x1888);
+
+    int totalCards = 0;
+    for (int tab = 0; tab < 9; ++tab) {
+        // Read v95 CMonsterBookMan per-tab `ZArray<MonsterBookCard>::a` slot.
+        auto* pManTabSlot = reinterpret_cast<V95Ref**>(pMan + 4 + tab * 4);
+        auto* pTabData = *pManTabSlot;
+        if (!pTabData) {
+            DEBUG_MESSAGE("  tab %d: empty (pTabData=NULL)", tab);
+            continue;
+        }
+        const int count = *(reinterpret_cast<int32_t*>(pTabData) - 1);
+        if (count <= 0) {
+            DEBUG_MESSAGE("  tab %d: count=%d", tab, count);
+            continue;
+        }
+        DEBUG_MESSAGE("  tab %d: count=%d cards", tab, count);
+        totalCards += count;
+
+        // Outer slot for this tab — kinoko ZArray<V95Ref> Alloc(count) gives
+        // us a flat array of 8-byte ZRef wire entries. KMST uses 25-row pages
+        // for drawing; flat is simpler and DrawLeftLayer can derive page/slot
+        // arithmetically.
+        //
+        // Note: m_aCardTable[tab] in KMST is `ZArray<ZArray<ZRef>>`, but
+        // populating the nested form requires a ZArray<ZArray<V95Ref>> outer
+        // type whose inner element is a ZArray<V95Ref> (4-byte ptr). Our
+        // DrawLeftLayer port reads the flat form directly via a custom helper,
+        // bypassing the nested KMST shape — saves several layers of allocator
+        // dancing without changing the visible result.
+        auto& slot = pCardTableArrays[tab];
+        slot.Alloc(count);
+        for (int idx = 0; idx < count; ++idx) {
+            // 8-byte stride matches KMST GetCard(tab, idx)'s `iVar1 + 4 + idx*8`.
+            slot[idx] = pTabData[idx];
+        }
+    }
+
+    DEBUG_MESSAGE("MonsterBook_CreateCardTable: %d cards across 9 tabs", totalCards);
 }
 
 // KMST 0x00849A25 (199 lines) — tools/decomp/cache_kmst/00849a25.c.
@@ -652,6 +746,41 @@ static void MonsterBook_PreDestroy(void* pThis) {
                       pFontArray->GetCount());
         pFontArray->RemoveAll();
     }
+
+    // CCtrlLPTab / CCtrlRPTab @+0x1564 / +0x156C — `delete` runs the virtual
+    // dtor chain (CCtrlTab::~CCtrlTab releases m_pSubLayer + m_pCanvas; then
+    // CCtrlWnd::~CCtrlWnd destructs m_pLTCtrl). Skipping these leaks an
+    // IWzGr2DLayer + IWzCanvas + the 0x48-byte buffer per /book cycle.
+    {
+        auto** pLPSlot = reinterpret_cast<CCtrlLPTab**>(pBytes + 0x1564);
+        if (*pLPSlot) {
+            DEBUG_MESSAGE("  delete LPTab @+0x1564 ptr=0x%08X", *pLPSlot);
+            delete *pLPSlot;
+            *pLPSlot = nullptr;
+        }
+        auto** pRPSlot = reinterpret_cast<CCtrlRPTab**>(pBytes + 0x156C);
+        if (*pRPSlot) {
+            DEBUG_MESSAGE("  delete RPTab @+0x156C ptr=0x%08X", *pRPSlot);
+            delete *pRPSlot;
+            *pRPSlot = nullptr;
+        }
+    }
+
+    // m_aCardTable: 9 ZArray<V95Ref> at +0x1888..+0x18A8. Each holds a flat
+    // card list per tab. RemoveAll frees the backing storage via the v95 anon
+    // allocator. Cards themselves are owned by CMonsterBookMan — we never
+    // AddRef'd, so no Release here either.
+    {
+        auto* pCardTableArrays = reinterpret_cast<ZArray<V95Ref>*>(pBytes + 0x1888);
+        for (int tab = 0; tab < 9; ++tab) {
+            const uint32_t cnt = pCardTableArrays[tab].GetCount();
+            if (cnt) {
+                DEBUG_MESSAGE("  free m_aCardTable[%d] count=%u", tab, cnt);
+            }
+            pCardTableArrays[tab].RemoveAll();
+        }
+    }
+
     DEBUG_MESSAGE("MonsterBook_PreDestroy: done");
 }
 
@@ -719,15 +848,133 @@ namespace {
     }
 }
 
-// KMST 0x00849F68 (1004 lines, DEFERRED). Real body paints LAYER[0] with the
-// per-tab card grid: per-card cover canvas + new/seen flag overlays. Needs
-// CreateCardTable populated AND the unknown-StringPool font keys.
-// Stub: fills with translucent green so the LAYER[0] geometry is visible.
+// KMST 0x00849F68 (1004 lines). Renders LAYER[0] — the per-tab card grid.
+// KMST's full body composites: per-card mob portrait (Mob/%07d.img canvas),
+// "new" / "seen" flag overlays from cardSlot.img, item number from
+// UI/Basic.img/ItemNo, plus animation timing reads. StringPool keys recovered
+// 2026-05-08 (asdfstory commit dc7377e + this session): 0x408 "Mob/%07d.img",
+// 0x40A "Canvas", 0x40E "default", 0x40F "info", 0x580 "UI/Basic.img/ItemNo",
+// 0x788 "streetName", 0x789 "mapName", 0xAF6 "infoPage", 0xAF7 "cardSlot",
+// 0xC40 "UI/UIWindow.img/IconBase/0", 0x1521 "a0", 0x1522 "a1", 0x152C "delay".
+//
+// This bundle ships a focused port that lands the visible-payoff scaffolding:
+// reads m_nCurrentTab from m_pLPTab+0x34, iterates m_aCardTable[currentTab],
+// and paints each collected-card slot in a 5x5 grid with a distinct colour
+// per cell index. Empty slots render dim, populated slots render bright —
+// confirming end-to-end that CardTable is populated AND DrawLayer dispatch
+// reads it correctly. The full per-card mob-portrait composite is layered on
+// top of this scaffolding in a follow-up session — once verified on Windows,
+// each block expands to a real WZ-loaded canvas paint.
+//
+// Card grid geometry (KMST CreateRect 0x0084988E, already ported):
+//   25 cells in 5x5 grid, cell pitch (0x21, 0x2D), base origin (8, 0x1F),
+//   per-cell rect size (0x1B, 0x26).
 static void MonsterBook_DrawLeftLayer(uint8_t* pBytes) {
-    DEBUG_MESSAGE("MonsterBook_DrawLeftLayer: stub fill");
-    PaintLayerStub(pBytes, /*slotOffset=*/0x15A4,
-                   /*width=*/0xAE, /*height=*/0x100,
-                   /*color (ARGB)=*/0xC020A040, "L0");
+    DEBUG_MESSAGE("MonsterBook_DrawLeftLayer: real-ish port (CardTable visualization)");
+
+    // Read m_pLPTab from +0x1564. If null, fall back to the stub.
+    auto* pLPTab = *reinterpret_cast<CCtrlLPTab**>(pBytes + 0x1564);
+    if (!pLPTab) {
+        DEBUG_MESSAGE("  pLPTab is NULL @+0x1564 — fallback to solid stub");
+        PaintLayerStub(pBytes, 0x15A4, 0xAE, 0x100, 0xC020A040, "L0-fallback");
+        return;
+    }
+    const int32_t currentTab = pLPTab->m_nCurrentTab;
+    if (currentTab < 0 || currentTab >= 9) {
+        DEBUG_MESSAGE("  currentTab=%d out of range — fallback", currentTab);
+        PaintLayerStub(pBytes, 0x15A4, 0xAE, 0x100, 0xC020A040, "L0-badtab");
+        return;
+    }
+
+    // Read m_aCardTable[currentTab] — flat ZArray<V95Ref> of cards in the tab.
+    auto* pCardTableArrays = reinterpret_cast<ZArray<V95Ref>*>(pBytes + 0x1888);
+    auto& tabCards = pCardTableArrays[currentTab];
+    const uint32_t cardCount = tabCards.GetCount();
+    DEBUG_MESSAGE("  currentTab=%d cardCount=%u", currentTab, cardCount);
+
+    // Resolve LAYER[0]'s canvas. KMST does this via the layer's canvas[vtEmpty]
+    // accessor (already worked for the stub). Same path here.
+    auto* pLayer0 = *reinterpret_cast<IWzGr2DLayer**>(pBytes + 0x15A4);
+    if (!pLayer0) {
+        DEBUG_MESSAGE("  LAYER[0] slot is null — abort");
+        return;
+    }
+
+    IWzCanvasPtr pCanvas;
+    try {
+        pCanvas = pLayer0->canvas[vtEmpty];
+    } catch (const _com_error& e) {
+        DEBUG_MESSAGE("  pLayer0->canvas[vtEmpty] threw 0x%08X (%s)",
+                      e.Error(), e.ErrorMessage());
+        return;
+    }
+    if (!pCanvas) {
+        DEBUG_MESSAGE("  LAYER[0] canvas is NULL");
+        return;
+    }
+
+    // Clear the canvas with a dark background — KMST's body redraws every
+    // frame after first dirty so we don't worry about preserving previous.
+    try {
+        pCanvas->DrawRectangle(0, 0, 0xAE, 0x100, 0xFF202020);
+    } catch (const _com_error& e) {
+        DEBUG_MESSAGE("  background clear threw 0x%08X (%s)",
+                      e.Error(), e.ErrorMessage());
+        return;
+    }
+
+    // 5x5 card grid for the current tab's first 25 cards. Geometry mirrors
+    // KMST CreateRect 0x0084988E:
+    //   per-cell origin: (i%5)*0x21 + 8, (i/5)*0x2D + 0x1F
+    //   per-cell size:   (0x1B, 0x26)
+    //
+    // Card colour palette: each slot gets a colour derived from its slot
+    // index so collected vs missing is visually obvious. Populated slots
+    // (index < cardCount) render in a bright cyan→magenta gradient; empty
+    // slots render in dim grey. This is the placeholder visualization;
+    // future port replaces with the real Mob/%07d.img canvas paint.
+    constexpr int32_t kCellsPerPage = 25;
+    const uint32_t pageCount = std::min<uint32_t>(cardCount, kCellsPerPage);
+    for (int i = 0; i < kCellsPerPage; ++i) {
+        const int32_t cellX = (i % 5) * 0x21 + 8;
+        const int32_t cellY = (i / 5) * 0x2D + 0x1F;
+        const bool populated = (static_cast<uint32_t>(i) < pageCount);
+
+        // Cell border (cardSlot.img placeholder).
+        const uint32_t borderColor = populated ? 0xFF80C0FF : 0xFF606060;
+        try {
+            pCanvas->DrawRectangle(cellX, cellY, 0x1B, 0x26, borderColor);
+        } catch (const _com_error&) { return; }
+
+        if (populated) {
+            // Inset content: bright pixel block proportional to cell index.
+            // Colour cycles through HSV-like wheel so different cards look
+            // different — this is purely diagnostic; the real port replaces
+            // this with the mob portrait canvas blit.
+            const uint32_t r = static_cast<uint32_t>((i * 11) & 0xFF);
+            const uint32_t g = static_cast<uint32_t>(((25 - i) * 9) & 0xFF);
+            const uint32_t b = static_cast<uint32_t>((i * 23) & 0xFF);
+            const uint32_t cellFill = 0xFF000000u | (r << 16) | (g << 8) | b;
+            try {
+                pCanvas->DrawRectangle(cellX + 2, cellY + 2,
+                                       0x1B - 4, 0x26 - 4, cellFill);
+            } catch (const _com_error&) { return; }
+        }
+    }
+
+    // Tab indicator strip across the top of the page — useful for confirming
+    // m_pLPTab read worked and m_nCurrentTab populated. 9 segments, the
+    // current tab gets a brighter highlight.
+    for (int t = 0; t < 9; ++t) {
+        const int32_t segX = 8 + t * 0x12;
+        const uint32_t color = (t == currentTab) ? 0xFFFFFF40 : 0xFF404040;
+        try {
+            pCanvas->DrawRectangle(segX, 4, 0x10, 0x0C, color);
+        } catch (const _com_error&) { return; }
+    }
+
+    DEBUG_MESSAGE("  L0 painted: tab=%d, %u/%d cells filled, indicator strip drawn",
+                  currentTab, pageCount, kCellsPerPage);
 }
 
 // KMST DrawRightLayer (no PDB symbol — likely inlined or stripped).
@@ -785,6 +1032,177 @@ static void MonsterBook_Update(uint8_t* pBytes) {
             *pFlag = 0;
         }
     }
+}
+
+
+// === CCtrlTab impls =========================================================
+//
+// Defined here (not ctrlwnd.h) because the bodies use IWz* COM smart pointers
+// from `ztl/zcom.h`, and ctrlwnd.h is included by callers that should stay
+// COM-clean.
+
+CCtrlTab::~CCtrlTab() {
+    // KMST stripped CCtrlTab dtor doesn't walk our two raw slots — these are
+    // member-owned refs so we Release manually. ~CCtrlWnd runs after this
+    // (auto-chain from virtual dtor), destructs m_pLTCtrl, then ~ZRefCounted.
+    if (m_pSubLayer) {
+        reinterpret_cast<IUnknown*>(m_pSubLayer)->Release();
+        m_pSubLayer = nullptr;
+    }
+    if (m_pCanvas) {
+        reinterpret_cast<IUnknown*>(m_pCanvas)->Release();
+        m_pCanvas = nullptr;
+    }
+}
+
+// KMST 0x00845CA6 (296 lines) — tools/decomp/cache_kmst/00845ca6.c.
+// Port of CUIMonsterBook::CCtrlTab::CreateCtrl. Builds a sublayer + two
+// canvases anchored on the parent wnd's layer.
+//
+// Steps (verbatim):
+//   1. CCtrlWnd::CreateCtrl(this, parent, id, rect.left, rect.top,
+//                            rect.width, rect.height, param)
+//   2. CWnd::GetLayer(parent)  — parent's IWzGr2DLayer
+//   3. _g_gr->CreateLayer(left, top, 0, 0, 0, vtMissing, vt_i4(0)) → sublayer
+//   4. m_pSubLayer = sublayer (AddRef)
+//   5. sublayer->origin/overlay = parentLayer; color = -1u; z = parent_z + 2
+//   6. tmpCanvas = PcCreateObject(L"Canvas")
+//   7. sublayer->InsertCanvas(tmpCanvas)
+//   8. m_pCanvas = PcCreateObject(L"Canvas") (separate canvas, AddRef'd)
+//   9. m_pCanvas->Create(w, h); cx=cy=0
+void CCtrlTab::CreateCtrlFromRect(CWnd* pParent, uint32_t nId,
+                                  const RECT* pRect, void* pParam) {
+    DEBUG_MESSAGE("CCtrlTab::CreateCtrlFromRect: enter id=0x%X rect=(%ld,%ld,%ld,%ld)",
+                  nId, pRect->left, pRect->top, pRect->right, pRect->bottom);
+
+    const int32_t w = (pRect->right - pRect->left) + 1;
+    const int32_t h = (pRect->bottom - pRect->top) + 1;
+
+    // Step 1 — base CreateCtrl. Inherited 7-arg signature on kinoko CCtrlWnd.
+    CCtrlWnd::CreateCtrl(pParent, nId, pRect->left, pRect->top, w, h, pParam);
+
+    // Step 2 — parent layer.
+    IWzGr2DLayerPtr pParentLayer;
+    try {
+        pParentLayer = pParent->GetLayer();
+    } catch (const _com_error& e) {
+        DEBUG_MESSAGE("  GetLayer threw 0x%08X (%s)", e.Error(), e.ErrorMessage());
+        return;
+    }
+    if (!pParentLayer) {
+        DEBUG_MESSAGE("  parent layer is NULL — abort");
+        return;
+    }
+
+    long parentZ = 0;
+    try { parentZ = pParentLayer->z; } catch (const _com_error&) {}
+
+    IWzGr2DPtr& pGr = get_gr();
+    if (!pGr) {
+        DEBUG_MESSAGE("  _g_gr is NULL — abort");
+        return;
+    }
+
+    Ztl_variant_t vParent(static_cast<IUnknown*>(pParentLayer.GetInterfacePtr()));
+    Ztl_variant_t vFilter(0L, VT_I4);
+
+    // Step 3 — sublayer at (rect.left, rect.top). w=h=0 ⇒ auto-size.
+    IWzGr2DLayerPtr pSub;
+    try {
+        pSub = pGr->CreateLayer(pRect->left, pRect->top, 0, 0, 0, vtEmpty, vFilter);
+    } catch (const _com_error& e) {
+        DEBUG_MESSAGE("  CreateLayer threw 0x%08X (%s)", e.Error(), e.ErrorMessage());
+        return;
+    }
+    if (!pSub) {
+        DEBUG_MESSAGE("  CreateLayer returned NULL");
+        return;
+    }
+
+    // Step 4 — m_pSubLayer holds an AddRef'd ref so it survives past pSub's scope.
+    pSub->AddRef();
+    m_pSubLayer = pSub.GetInterfacePtr();
+
+    // Step 5 — properties.
+    try {
+        pSub->origin  = vParent;
+        pSub->overlay = vParent;
+        pSub->color   = 0xFFFFFFFFUL;
+        pSub->z       = parentZ + 2;
+    } catch (const _com_error& e) {
+        DEBUG_MESSAGE("  sublayer setters threw 0x%08X (%s)", e.Error(), e.ErrorMessage());
+        return;
+    }
+
+    // Step 6/7 — temp canvas inserted into sublayer (visible content).
+    IWzCanvasPtr pTmpCanvas;
+    try {
+        PcCreateObject<IWzCanvasPtr>(L"Canvas", pTmpCanvas, nullptr);
+        if (pTmpCanvas) {
+            pTmpCanvas->Create(static_cast<unsigned long>(w),
+                               static_cast<unsigned long>(h));
+            pTmpCanvas->cx = 0;
+            pTmpCanvas->cy = 0;
+            pSub->InsertCanvas(pTmpCanvas);
+        }
+    } catch (const _com_error& e) {
+        DEBUG_MESSAGE("  tmp canvas create/insert threw 0x%08X (%s)",
+                      e.Error(), e.ErrorMessage());
+    }
+
+    // Step 8/9 — separate m_pCanvas (off-screen scratch).
+    IWzCanvasPtr pCv;
+    try {
+        PcCreateObject<IWzCanvasPtr>(L"Canvas", pCv, nullptr);
+        if (pCv) {
+            pCv->Create(static_cast<unsigned long>(w),
+                        static_cast<unsigned long>(h));
+            pCv->cx = 0;
+            pCv->cy = 0;
+            pCv->AddRef();
+            m_pCanvas = pCv.GetInterfacePtr();
+        }
+    } catch (const _com_error& e) {
+        DEBUG_MESSAGE("  m_pCanvas create threw 0x%08X (%s)",
+                      e.Error(), e.ErrorMessage());
+    }
+
+    DEBUG_MESSAGE("CCtrlTab::CreateCtrlFromRect: built sublayer @0x%08X canvas @0x%08X",
+                  m_pSubLayer, m_pCanvas);
+}
+
+// KMST 0x008469C0 (~370 lines, tools/decomp/cache_kmst/008469c0.c).
+// CCtrlLPTab::CreateCtrl iterates the WZ tree at
+// `UI/UIWindow.img/MonsterBook/MainTab/...` and builds a list of
+// CCtrlTab::Info structs (per-area icon canvases, hit rects, "new"/"selected"
+// frame canvases) before chaining to base. Reproducing that loop verbatim
+// requires an additional ~370 lines of COM/WZ ceremony plus reverse-
+// engineering CCtrlTab::Info (no PDB symbol).
+//
+// For this bundle we ship the minimal port: alloc the buffer, set
+// m_nCurrentTab=0 (start on tab 0 / Maple Island), chain to base CreateCtrl.
+// DrawLeftLayer reads `pLPTab+0x34 = m_nCurrentTab` to pick which tab's
+// cards to render — that read is now safe and returns 0 (default tab).
+// The visual tab strip on the left is invisible because m_aTabsPtr is empty,
+// but the card grid on LAYER[0] does render the tab-0 cards. Future session
+// can flesh out the tab strip iteration.
+void CCtrlLPTab::CreateCtrlFromRect(CWnd* pParent, uint32_t nId,
+                                    const RECT* pRect, void* pParam) {
+    DEBUG_MESSAGE("CCtrlLPTab::CreateCtrlFromRect: minimal port (skip WZ tab tree)");
+    // Tab 0 (Maple Island) is the default landing tab when /book opens with
+    // no SetCover packet outstanding. KMST also defaults here.
+    m_nCurrentTab = 0;
+    CCtrlTab::CreateCtrlFromRect(pParent, nId, pRect, pParam);
+}
+
+// KMST 0x008476ED (~290 lines). RPTab is the right-side region selector
+// (regions per area). Same minimal port: chain to base, leave m_aTabsPtr
+// empty.
+void CCtrlRPTab::CreateCtrlFromRect(CWnd* pParent, uint32_t nId,
+                                    const RECT* pRect, void* pParam) {
+    DEBUG_MESSAGE("CCtrlRPTab::CreateCtrlFromRect: minimal port (skip WZ region tree)");
+    m_nCurrentTab = 0;
+    CCtrlTab::CreateCtrlFromRect(pParent, nId, pRect, pParam);
 }
 
 

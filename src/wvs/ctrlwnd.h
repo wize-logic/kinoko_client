@@ -255,3 +255,74 @@ public:
 };
 
 static_assert(sizeof(CCtrlCheckBox) == 0x74);
+
+
+// CUIMonsterBook::CCtrlTab — KMST-only inner class, port of:
+//   KMST 0x00845CA6  CCtrlTab::CreateCtrl(CWnd*, uint, RECT*, void*)
+//   KMST 0x008469C0  CCtrlLPTab::CreateCtrl  — overrides + WZ tab tree load
+//   KMST 0x008476ED  CCtrlRPTab::CreateCtrl  — overrides + WZ region tree load
+//
+// 0x48-byte object that KMST stamps with 3 hand-built vtables (IGObj /
+// IUIMsgHandler / ZRefCounted) at +0/+4/+8 with CreateCtrl at IGObj slot 10
+// and a 4-arg signature `(CWnd*, uint, RECT*, void*)`. kinoko's CCtrlWnd has
+// CreateCtrl at IGObj slot 2 with a 7-arg signature, so naive single-vtable
+// inheritance here would clobber the wrong slot. Solution: inherit from
+// CCtrlWnd so kinoko's vtable shape stays valid, but expose a NEW non-virtual
+// `CreateCtrlFromRect` method that callers invoke directly. Callers (= our
+// own MonsterBook_CreateCtrl) reach CCtrlTab via a typed C++ pointer, never
+// via vtable dispatch, so the slot mismatch never fires.
+//
+// The DrawLeftLayer port reads `*(this+0x1564)+0x34` to get the current tab
+// index — that's pLPTab->m_nCurrentTab. Layout from KMST CCtrlTab member
+// writes (CreateCtrl 0x00845CA6 + LPTab 0x008469C0):
+//   +0x00..+0x33  CCtrlWnd base (0x34 bytes — kinoko's existing layout)
+//   +0x34         m_nCurrentTab (int)
+//   +0x38         m_nVisibleTab (int) — paint cursor offset; default 0
+//   +0x3C         m_pSubLayer    (IWzGr2DLayer* raw COM ptr)
+//   +0x40         m_pCanvas      (IWzCanvas* raw COM ptr)
+//   +0x44         m_aTabs        (ZArray<ZRef<Info>> — per-tab visual data)
+// Total: 0x48 bytes ✓ (matches KMST's `new(0x48)` allocation in
+// CUIMonsterBook::CreateCtrl).
+class CCtrlTab : public CCtrlWnd {
+public:
+    int32_t  m_nCurrentTab;        // +0x34
+    int32_t  m_nVisibleTab;        // +0x38
+    void*    m_pSubLayer;          // +0x3C — IWzGr2DLayer* raw COM ptr (Release in dtor)
+    void*    m_pCanvas;            // +0x40 — IWzCanvas* raw COM ptr (Release in dtor)
+    void*    m_aTabsPtr;           // +0x44 — ZArray<ZRef<Info>>::a (T*; count is at *(a-1))
+
+    CCtrlTab() : CCtrlWnd(0),
+                 m_nCurrentTab(0), m_nVisibleTab(0),
+                 m_pSubLayer(nullptr), m_pCanvas(nullptr),
+                 m_aTabsPtr(nullptr) {
+    }
+    // dtor lives in uimonsterbook.cpp where IUnknown is in scope.
+    virtual ~CCtrlTab() override;
+
+    // Adapter on CCtrlWnd::CreateCtrl. KMST CCtrlTab's CreateCtrl calls
+    // CCtrlWnd::CreateCtrl with the rect's left/top/(width-1)/(height-1)
+    // unpacked then builds an IWzGr2DLayer/IWzCanvas pair anchored on the
+    // parent wnd's layer. Our port lives in uimonsterbook.cpp because the
+    // body uses Ztl_variant_t / IWzGr2DLayerPtr / PcCreateObject helpers
+    // that the wider mod includes; ctrlwnd.h stays standalone-includeable.
+    void CreateCtrlFromRect(CWnd* pParent, uint32_t nId, const RECT* pRect, void* pParam);
+};
+
+static_assert(sizeof(CCtrlTab) == 0x48);
+
+
+// CUIMonsterBook::CCtrlLPTab — left-page tab strip (9 area tabs).
+// Override CreateCtrlFromRect with WZ-tree iteration that loads each area's
+// per-frame canvases into a `CCtrlTab::Info` struct, then chains to base.
+class CCtrlLPTab : public CCtrlTab {
+public:
+    CCtrlLPTab() = default;
+    void CreateCtrlFromRect(CWnd* pParent, uint32_t nId, const RECT* pRect, void* pParam);
+};
+
+// CUIMonsterBook::CCtrlRPTab — right-page tab strip (regions per area).
+class CCtrlRPTab : public CCtrlTab {
+public:
+    CCtrlRPTab() = default;
+    void CreateCtrlFromRect(CWnd* pParent, uint32_t nId, const RECT* pRect, void* pParam);
+};
