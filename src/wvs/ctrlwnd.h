@@ -152,6 +152,37 @@ public:
 static_assert(sizeof(CCtrlComboBox) == 0x110);
 
 
+// CCtrlEdit — single-line edit control (search box / chat box / etc).
+// v95 ctor at 0x004DF870 (0xB4-byte object). CreateCtrl is the inherited
+// CCtrlWnd::CreateCtrl thunk at 0x004F0900 — the v95 IGObj vtable for
+// CCtrlEdit puts it at slot 2 (verified by dumping vtable @ 0xb4a66c).
+// CREATEPARAM ctor at 0x004E09E0, dtor at 0x00484890; size unknown from
+// pseudocode (highest written member +0x5C) so we round to 0x70 with
+// internal padding. Used by CUIMonsterBook for the search box at id 0x7D5.
+class CCtrlEdit : public CCtrlWnd {
+public:
+    struct CREATEPARAM {
+        uint8_t padding[0x70];
+
+        CREATEPARAM() {
+            reinterpret_cast<void(__thiscall*)(CREATEPARAM*)>(0x004E09E0)(this);
+        }
+        ~CREATEPARAM() {
+            reinterpret_cast<void(__thiscall*)(CREATEPARAM*)>(0x00484890)(this);
+        }
+    };
+    static_assert(sizeof(CREATEPARAM) == 0x70);
+
+    uint8_t padding[0xB4 - sizeof(CCtrlWnd)];
+
+    CCtrlEdit() : CCtrlWnd(0) {
+        reinterpret_cast<void(__thiscall*)(CCtrlEdit*)>(0x004DF870)(this);
+    }
+};
+
+static_assert(sizeof(CCtrlEdit) == 0xB4);
+
+
 class CCtrlButton : public CCtrlWnd {
 public:
     struct CREATEPARAM {

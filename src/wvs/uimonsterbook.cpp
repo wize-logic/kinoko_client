@@ -162,6 +162,31 @@ static void MonsterBook_CreateCtrl(void* pThis) {
                       pBtn, static_cast<unsigned>(spec.offset));
     }
     DEBUG_MESSAGE("MonsterBook_CreateCtrl: 6 buttons populated");
+
+    // Search box — KMST creates a CCtrlEdit at +0xED0 (v95 +0x1570) with id
+    // 0x7D5, rect (49, 30, 120, 15). KMST asm at 0x848AE7 calls CREATEPARAM
+    // ctor then sets local field+0x1C to 0xFFFFFFFF before CreateCtrl;
+    // mirror that here. The v95 IGObj vtable for CCtrlEdit (@ 0xB4A66C)
+    // puts CreateCtrl at slot 2 = CCtrlWnd::CreateCtrl @ 0x004F0900 — same
+    // base thunk every CCtrlWnd subclass uses, so a direct call through the
+    // C++ wrapper is the right path.
+    DEBUG_MESSAGE("  edit id=0x7D5 at +0x1570 rect=(49,30,120,15)");
+    auto* pEdit = new CCtrlEdit();
+    if (pEdit) {
+        CCtrlEdit::CREATEPARAM ep;
+        // KMST 848AEF: or [ebp-0x4C], 0xFFFFFFFF — i.e. CREATEPARAM[+0x1C] = -1.
+        // Field is uninitialised by the ctor (only +0,+4,+8,+0xC,+0x10,+0x14,
+        // +0x38 are touched). Likely max-length / selection sentinel.
+        *reinterpret_cast<int32_t*>(reinterpret_cast<uint8_t*>(&ep) + 0x1C) = -1;
+
+        auto* pEditSlot = reinterpret_cast<ZRef<CCtrlEdit>*>(
+            static_cast<uint8_t*>(pThis) + 0x1570);
+        *pEditSlot = pEdit;
+        pEdit->CreateCtrl(pParent, 0x7D5, 0x31, 0x1E, 0x78, 0xF, &ep);
+        DEBUG_MESSAGE("    edit ok pEdit=0x%08X stored at +0x1570", pEdit);
+    } else {
+        DEBUG_MESSAGE("    edit alloc failed");
+    }
 }
 
 // KMST 0x00848C8A (601 lines) — tools/decomp/cache_kmst/00848c8a.c, full
@@ -532,6 +557,14 @@ static void MonsterBook_PreDestroy(void* pThis) {
         DEBUG_MESSAGE("  releasing ZRef<CCtrlButton> @+0x%X",
                       static_cast<unsigned>(offset));
         *pSlot = nullptr;
+    }
+
+    // CCtrlEdit search box — drop our refcount so the v95 dtor reclaims it
+    // before ~CUIWnd runs. m_pBtClose at +0x80 stays for ~CUIWnd to handle.
+    {
+        auto* pEditSlot = reinterpret_cast<ZRef<CCtrlEdit>*>(pBytes + 0x1570);
+        DEBUG_MESSAGE("  releasing ZRef<CCtrlEdit> @+0x1570");
+        *pEditSlot = nullptr;
     }
     DEBUG_MESSAGE("MonsterBook_PreDestroy: done");
 }
