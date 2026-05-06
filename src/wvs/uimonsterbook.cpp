@@ -54,6 +54,13 @@ constexpr uintptr_t kCWvsContext_MonsterBookSlotPtr_Off   = 0x3EB4;
 constexpr uintptr_t kZRefCounted_RefField_Off             = 0xC;
 constexpr uintptr_t kDAT_MonsterBookGlobal                = 0x00C6F010;
 
+// CWnd::Update — hooked so we can run our dirty-flag → DrawLayer dispatch
+// before the base class iterates child wnds. Every CWnd::Update call in v95
+// flows through this address; we filter on `pThis == g_pV95MonsterBookGlobal`
+// so the override only fires for our buffer. (Detours patches the address
+// itself, so vtable-dispatched calls into 0x009AE7C0 are also caught.)
+constexpr uintptr_t kCWnd_Update                          = 0x009AE7C0;
+
 
 // === Mod-side state =========================================================
 
@@ -530,10 +537,156 @@ static void MonsterBook_PreDestroy(void* pThis) {
 }
 
 
+// === Per-layer paint =======================================================
+//
+// KMST CUIMonsterBook::DrawLayer (0x0084CBE7, 18 lines) dispatches the
+// dirty-flag fired by Update to DrawLeftLayer / DrawRightLayer / DrawSelectLayer
+// based on the layer index (0/1/2). KMST's Draw* bodies are heavy
+// (DrawLeftLayer 1004 lines, DrawSelectLayer 276 lines, DrawRightLayer is
+// stripped from the PDB so its size is unknown) and depend on data we don't
+// populate yet (CreateFontArray, CreateCardTable, the +0x1564 right-tab
+// state pointer). Porting them blind without Windows iteration access is a
+// recipe for crashes that break the working LANDED-VERIFIED baseline.
+//
+// This batch ships VISIBLE-PROOF stubs — each layer's paint routine fills
+// its canvas with a flat color rectangle via IWzCanvas::DrawRectangle. When
+// `/book` opens, the three layers will render as three colored panels in
+// the book window. That proves end-to-end:
+//   - Update hook fires for our wnd
+//   - dirty flags poll correctly
+//   - DrawLayer dispatcher routes to the right paint
+//   - the layer canvas accepts paint calls and the v95 Gr2D layer pipeline
+//     actually composites our content onto the screen
+//
+// A future session with Windows iteration replaces these stubs with the
+// real WZ-loaded paint bodies; the dispatch scaffolding stays.
+
+namespace {
+    // Paint a flat color into the layer's exposed canvas. The layer's canvas
+    // was Created in MonsterBook_CreateLayer with the size kLayers[i]
+    // recorded; we re-fetch it via IWzGr2DLayer::canvas (propget) since
+    // the local pCanvas we used during CreateLayer was Released after
+    // InsertCanvas (the layer holds its own AddRef'd ref).
+    void PaintLayerStub(uint8_t* pBytes, size_t slotOffset,
+                        unsigned long width, unsigned long height,
+                        unsigned int color, const char* tag) {
+        auto* pLayerSlot = reinterpret_cast<IWzGr2DLayer**>(pBytes + slotOffset);
+        IWzGr2DLayer* pLayer = *pLayerSlot;
+        if (!pLayer) {
+            DEBUG_MESSAGE("  [%s] layer slot @+0x%X is null — skip",
+                          tag, static_cast<unsigned>(slotOffset));
+            return;
+        }
+        try {
+            // pLayer->canvas[vtEmpty] returns the first inserted canvas.
+            // Indexer syntax matches the pattern in inlink.cpp:42 for the
+            // analogous `[propget] HRESULT item([in, optional] VARIANT, ...)`
+            // accessor on IWzShape2D. The vIndex is optional in the IDL but
+            // the .tlh-generated indexer typically requires an explicit
+            // VARIANT — passing vtEmpty defaults to the first frame.
+            IWzCanvasPtr pCanvas = pLayer->canvas[vtEmpty];
+            if (!pCanvas) {
+                DEBUG_MESSAGE("  [%s] pLayer->canvas[vtEmpty] returned null",
+                              tag);
+                return;
+            }
+            pCanvas->DrawRectangle(0, 0, width, height, color);
+            DEBUG_MESSAGE("  [%s] DrawRectangle(0,0,%lu,%lu,0x%08X) ok",
+                          tag, width, height, color);
+        } catch (const _com_error& e) {
+            DEBUG_MESSAGE("  [%s] paint threw HRESULT 0x%08X (%s)",
+                          tag, static_cast<unsigned>(e.Error()), e.ErrorMessage());
+        }
+    }
+}
+
+// KMST 0x00849F68 (1004 lines, DEFERRED). Real body paints LAYER[0] with the
+// per-tab card grid: per-card cover canvas + new/seen flag overlays. Needs
+// CreateCardTable populated AND the unknown-StringPool font keys.
+// Stub: fills with translucent green so the LAYER[0] geometry is visible.
+static void MonsterBook_DrawLeftLayer(uint8_t* pBytes) {
+    DEBUG_MESSAGE("MonsterBook_DrawLeftLayer: stub fill");
+    PaintLayerStub(pBytes, /*slotOffset=*/0x15A4,
+                   /*width=*/0xAE, /*height=*/0x100,
+                   /*color (ARGB)=*/0xC020A040, "L0");
+}
+
+// KMST DrawRightLayer (no PDB symbol — likely inlined or stripped).
+// DEFERRED: would render the per-card detail panel on the right side
+// (mob portrait + drops + skill). Stub: translucent magenta.
+static void MonsterBook_DrawRightLayer(uint8_t* pBytes) {
+    DEBUG_MESSAGE("MonsterBook_DrawRightLayer: stub fill");
+    PaintLayerStub(pBytes, /*slotOffset=*/0x15AC,
+                   /*width=*/0xDC, /*height=*/0x122,
+                   /*color (ARGB)=*/0xC0A040A0, "L1");
+}
+
+// KMST 0x0084B3A0 (276 lines, DEFERRED). Real body composites the cover-
+// card image + selection cursor onto LAYER[2]. Needs +0x1564 right-tab state
+// (we don't populate it), CUserLocal::GetMonsterBookCover (no v95 symbol),
+// and `UI/UIWindow.img/MonsterBook/...` cursor paths from StringPool keys.
+// Stub: translucent yellow so the LAYER[2] overlay is visible above LAYER[0].
+static void MonsterBook_DrawSelectLayer(uint8_t* pBytes) {
+    DEBUG_MESSAGE("MonsterBook_DrawSelectLayer: stub fill");
+    PaintLayerStub(pBytes, /*slotOffset=*/0x15B4,
+                   /*width=*/0xAE, /*height=*/0x100,
+                   /*color (ARGB)=*/0xA0FFE040, "L2");
+}
+
+// KMST CUIMonsterBook::DrawLayer (0x0084CBE7) dispatcher. Verbatim port —
+// 3-way switch on the layer index passed by Update.
+static void MonsterBook_DrawLayer(uint8_t* pBytes, int layerIdx) {
+    switch (layerIdx) {
+    case 0: MonsterBook_DrawLeftLayer(pBytes);   break;
+    case 1: MonsterBook_DrawRightLayer(pBytes);  break;
+    case 2: MonsterBook_DrawSelectLayer(pBytes); break;
+    default:
+        DEBUG_MESSAGE("MonsterBook_DrawLayer: unexpected idx=%d", layerIdx);
+        break;
+    }
+}
+
+// KMST CUIMonsterBook::Update (0x00847FF0, 23 lines). Walks the 3 dirty
+// flags at v95 +0x15A0 / +0x15A8 / +0x15B0 (KMST +0xF00 / +0xF08 / +0xF10),
+// fires DrawLayer for each set flag, then chains to CWnd::Update for the
+// child-wnd traversal + invalidation.
+//
+// Note: KMST's body would naturally override the IGObj::Update vtable slot.
+// v95's stripped CUIMonsterBook ctor doesn't stamp such an override into
+// the vtable, so vtable-driven Update calls hit v95's plain CWnd::Update at
+// 0x009AE7C0. We hook that address (below) and run this body BEFORE chaining
+// to the original — net effect matches what KMST's vtable override would do.
+static void MonsterBook_Update(uint8_t* pBytes) {
+    static constexpr size_t kDirtyOffsets[3] = { 0x15A0, 0x15A8, 0x15B0 };
+    for (int i = 0; i < 3; ++i) {
+        auto* pFlag = reinterpret_cast<int32_t*>(pBytes + kDirtyOffsets[i]);
+        if (*pFlag != 0) {
+            DEBUG_MESSAGE("MonsterBook_Update: layer %d dirty — paint", i);
+            MonsterBook_DrawLayer(pBytes, i);
+            *pFlag = 0;
+        }
+    }
+}
+
+
 // === Hooks ==================================================================
 
 static auto CWvsContext__UI_Open = kCWvsContext_UI_Open;
 static auto CWvsContext__UI_Close = kCWvsContext_UI_Close;
+static auto CWnd__Update = kCWnd_Update;
+
+void __fastcall CWnd__Update_hook(void* pThis, void* /*EDX*/) {
+    // Every CWnd::Update call in the v95 client flows through this hook —
+    // chat, hotbar, every UI window. Filter on the live MonsterBook slot so
+    // we only run the dirty-flag dispatch for our buffer. The check is on
+    // g_pV95MonsterBookGlobal (= DAT_00c6f010) rather than g_pMonsterBookUI
+    // because UI_Close clears the latter early in its hook; a stray Update
+    // tick during teardown would otherwise re-run paints on a freed buffer.
+    if (pThis != nullptr && pThis == g_pV95MonsterBookGlobal) {
+        MonsterBook_Update(static_cast<uint8_t*>(pThis));
+    }
+    reinterpret_cast<void(__thiscall*)(void*)>(CWnd__Update)(pThis);
+}
 
 void __fastcall CWvsContext__UI_Open_hook(void* pCtx, void* /*EDX*/,
                                           int nUIType, int nOption) {
@@ -618,4 +771,6 @@ void __fastcall CWvsContext__UI_Close_hook(void* pCtx, void* /*EDX*/, int nUITyp
 void AttachUIMonsterBook() {
     ATTACH_HOOK(CWvsContext__UI_Open, CWvsContext__UI_Open_hook);
     ATTACH_HOOK(CWvsContext__UI_Close, CWvsContext__UI_Close_hook);
+    // Hooks every CWnd::Update — filtered to our wnd inside the detour.
+    ATTACH_HOOK(CWnd__Update, CWnd__Update_hook);
 }
