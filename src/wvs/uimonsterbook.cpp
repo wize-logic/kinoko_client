@@ -422,9 +422,14 @@ static void MonsterBook_CreateLayer(void* pThis) {
                 pBgLayer->origin = vParent;
                 pBgLayer->overlay = vParent;
                 pBgLayer->color = 0xFFFFFFFFUL;
-                pBgLayer->z = parentZ;  // parent's z — under sub-layers
+                // z = parentZ - 1 puts the bg STRICTLY below everything at
+                // parent z (= 10), including the CCtrlButtons. Last test
+                // showed buttons disappeared when bg was at parentZ — same
+                // z + bg inserted later in the chain = bg drew over them.
+                // Sub-layers at z=11/12 are above; foreground stays correct.
+                pBgLayer->z = parentZ - 1;
                 DEBUG_MESSAGE("  bg-layer configured: origin/overlay=parent z=%ld",
-                              parentZ);
+                              parentZ - 1);
 
                 IWzCanvasPtr pBgLayerCanvas;
                 PcCreateObject<IWzCanvasPtr>(L"Canvas", pBgLayerCanvas, nullptr);
