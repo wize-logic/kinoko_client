@@ -45,6 +45,7 @@ void AttachTemporaryStatMod();
 void AttachElementalDamageMod();
 void AttachIconIconMod();
 void AttachExceptionHandler();
+void AttachUIMonsterBook();
 
 inline void AttachClientHooks() {
     AttachClientBypass();
@@ -55,6 +56,7 @@ inline void AttachClientHooks() {
     AttachElementalDamageMod();
     AttachIconIconMod();
     AttachExceptionHandler();
+    AttachUIMonsterBook();
 }
 
 

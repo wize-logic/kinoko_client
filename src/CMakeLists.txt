@@ -14,6 +14,7 @@ add_library(injector SHARED
         itemicon.cpp
         walker.cpp
         debug.cpp
+        wvs/uimonsterbook.cpp
 )
 
 target_precompile_headers(injector PRIVATE pch.h)
