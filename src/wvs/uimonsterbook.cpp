@@ -436,26 +436,43 @@ static void MonsterBook_CreateRect(void* pThis) {
 // Allocates the 9-column ZArray<ZArray<ZRef<MonsterBookCard>>> at v95 +0x1888
 // (= KMST +0x11E8) — backing store for all collected cards by tab/area.
 //
-// DEFERRED Phase 2-port-4: KMST's body iterates `CMonsterBookMan::GetCard(p,
-// &out, tab, idx)` (the (long, long) overload at KMST 0x006823F1) to walk
-// each tab's card list. v95 stripped that overload — the v95 names cache
-// shows only the by-cardId GetCard at 0x00662930 (`?GetCard@CMonsterBookMan@@QBE
-// ?AV?$ZRef@UMonsterBookCard@@@@J@Z`, single `J` arg). Without the (tab, idx)
-// helper the population step has no enumeration source. v95's surviving
-// CUIMonsterBook::GetCard_1 (0x00808FB0) reads `*(this+0x1888 + tabIdx*4)`;
-// when the slot is zero (our memset state) it returns null cards and
-// downstream LoadMobInfo / draw paths render no sprites. That is the
-// current visual behaviour and it is non-crashing.
+// DEFERRED Phase 2-port-4 (re-confirmed 2026-05-07 with Task 1 cipher unblocked):
+// the population path needs THREE pieces v95 doesn't ship:
 //
-// To populate later we'd need to either find a v95-side enumeration helper
-// (ZMap iteration via GetHeadPosition+GetNext on the cardId hashmap exists,
-// but cards aren't tagged by tab in MonsterBookCard so that gives all-cards
-// ungrouped), or rebuild the per-tab arrays inside CMonsterBookMan ourselves
-// from WZ data at boot. Both paths are larger than this batch.
+//   1. Per-tab GetCard enumerator. KMST `GetCard(this, &out, tab, idx)` at
+//      0x006823F1 is stripped from v95; only by-cardId `GetCard(this, &out,
+//      cardId)` at 0x00662930 survives. v95 also lacks the
+//      `?GetHeadPosition@?$ZMap@JV?$ZRef@UMonsterBookCard@@...` symbol —
+//      ZMap iteration helpers exist for the GW_MonsterBookCard variant
+//      (master template, used by data load) but not for MonsterBookCard
+//      (player's collected cards, what we want).
+//
+//   2. cardId → mobId mapping. Verified empirically via v95's
+//      CMonsterBookAccessor::SetCount (0x009118F0) — the MonsterBookCard
+//      struct stores only `(short)(cardId - 0x50E0)` + `(byte)count`, no
+//      mobId field. Mapping must come from WZ:
+//      `Item.wz/Consume/0238.img/<cardId>/info/mob`. CItemInfo::GetItemInfo
+//      at v95 0x005A8F20 returns IWzPropertyPtr we could read; ~700 lookups
+//      one-time at /book open, sub-second total.
+//
+//   3. mobId → tab grouping. KMST source not available; canonical 9-tab
+//      ranges aren't documented in v95 GMS WZ either (no
+//      Etc.wz/MonsterBook.img). Closest source is the 9-region MapleStory
+//      mob-ID prefix convention (1xxxxxx Maple, 2xxxxxx Victoria, etc.)
+//      but boundaries are heuristic.
+//
+// Even with all three solved, CreateCardTable is **invisible** until
+// DrawLeftLayer's real body (KMST 0x00849F68) is also ported — the current
+// stub paints a green test rectangle and ignores m_aCardTable entirely.
+// Empty-init is safe: GetCard_1 (v95 0x00808FB0) null-checks
+// `*(this+0x1888 + tabIdx*4)` and returns nullptr cards; downstream paths
+// render no sprites without crashing. That is the current behaviour.
+//
+// Future plan: do this work as a single batch with the DrawLeftLayer port
+// so the visible payoff lands in lockstep. Splitting them produces invisible
+// data churn for one or two sessions.
 static void MonsterBook_CreateCardTable(void* /*pThis*/) {
     // No-op: zero-initialised buffer is a valid "no cards loaded" state.
-    // GetCard_1 null-checks the per-tab slot before dereferencing, so empty
-    // tables are safe.
 }
 
 // KMST 0x00849A25 (199 lines) — tools/decomp/cache_kmst/00849a25.c.
