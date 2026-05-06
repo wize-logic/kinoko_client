@@ -101,12 +101,12 @@ static void MonsterBook_CreateCtrl(void* pThis) {
         const wchar_t* sUOL;
     };
     static const ButtonSpec kButtons[] = {
-        { 0x0080, 1000,    0x1AD, 8,     L"UIWindow.img/MonsterBook/BtClose"    },
-        { 0x1578, 2000,    0x0AF, 0x1D,  L"UIWindow.img/MonsterBook/BtSearch"   },
-        { 0x1580, 0x07D1,  0x030, 0x11D, L"UIWindow.img/MonsterBook/arrowLeft"  },
-        { 0x1588, 0x07D2,  0x0B9, 0x11D, L"UIWindow.img/MonsterBook/arrowRight" },
-        { 0x1590, 0x07D3,  0x10E, 0x11D, L"UIWindow.img/MonsterBook/arrowLeft"  },
-        { 0x1598, 0x07D4,  0x197, 0x11D, L"UIWindow.img/MonsterBook/arrowRight" },
+        { 0x0080, 1000,    0x1AD, 8,     L"UI/UIWindow.img/MonsterBook/BtClose"    },
+        { 0x1578, 2000,    0x0AF, 0x1D,  L"UI/UIWindow.img/MonsterBook/BtSearch"   },
+        { 0x1580, 0x07D1,  0x030, 0x11D, L"UI/UIWindow.img/MonsterBook/arrowLeft"  },
+        { 0x1588, 0x07D2,  0x0B9, 0x11D, L"UI/UIWindow.img/MonsterBook/arrowRight" },
+        { 0x1590, 0x07D3,  0x10E, 0x11D, L"UI/UIWindow.img/MonsterBook/arrowLeft"  },
+        { 0x1598, 0x07D4,  0x197, 0x11D, L"UI/UIWindow.img/MonsterBook/arrowRight" },
     };
 
     auto* pParent = reinterpret_cast<CWnd*>(pThis);
