@@ -71,6 +71,19 @@ namespace {
     // UI_Open's "already open" gate reads the slot directly so this is
     // just a friendly handle for the close-side log line.
     void* g_pMonsterBookUI = nullptr;
+
+    // Bg-layer ownership. KMST builds 3 child layers but no full-window
+    // bg layer — the bg image normally lives in CWnd's draw chain via
+    // m_sBackgrndUOL+m_pCanvas mechanics (which our wnd doesn't have
+    // populated since we never went through the standard Open path).
+    // Instead we attach a 4th overlay layer parented to CWnd::GetLayer,
+    // sized to the full 475x349 wnd, with the bg WZ canvas copied in.
+    //
+    // MonsterBook is a singleton (DAT_00c6f010 gates open/close) so a
+    // file-scope smart-ptr is safe — single open instance at a time. The
+    // smart-ptr's Release fires on Construct's overwrite (next open) or
+    // explicitly in PreDestroy.
+    IWzGr2DLayerPtr g_pBgLayer;
 }
 
 
@@ -360,91 +373,84 @@ static void MonsterBook_CreateLayer(void* pThis) {
 
     DEBUG_MESSAGE("MonsterBook_CreateLayer: all 3 layers built ok");
 
-    // ----- Background canvas ----------------------------------------------
+    // ----- Background layer (4th overlay) ---------------------------------
     //
-    // The 3 sub-layers above are foreground content (LeftLayer / RightLayer
-    // / SelectLayer per KMST CUIMonsterBook::Update at 0x847FF0). They have
-    // empty backing canvases that DrawLeftLayer / DrawRightLayer /
-    // DrawSelectLayer would normally fill on demand — but those Draw* are
-    // stripped from v95, so the empty canvases stay transparent, and the
-    // parent layer behind them stays empty too. Result: nothing visible.
+    // The previous test confirmed parent-layer-direct-InsertCanvas does NOT
+    // render even though the canvas resolved fine, parent visible=1, and
+    // InsertCanvas didn't throw. Copying into a sub-layer's canvas DID
+    // render (visible as a 174x256 chunk at L0's (40,25) origin). So the
+    // parent layer is an overlay container that doesn't paint its own
+    // canvases — we need a sub-layer.
     //
-    // Quickest path to a visible window: load the WZ-side bg canvas
-    // (UI/UIWindow.img/MonsterBook/backgrnd) and insert it into the parent
-    // layer. This puts the bg at parent.z (=10 in the test logs) — under
-    // our sub-layers at z=11/12, so the foreground draws on top correctly
-    // once the Draw* ports land. Pattern lifted verbatim from
-    // temporarystat.cpp:135 + 161 (get_unknown(get_rm()->GetObjectA(UOL))
-    // → InsertCanvas).
+    // Add a 4th overlay layer at (0, 0) covering the full 475x349 wnd
+    // client area, parented to pParentLayer with z=parent+0 (under the
+    // 3 foreground sub-layers at z=parent+1/+2). Copy the WZ-resolved bg
+    // pixels into the layer's canvas. Same pattern as the 3 KMST sub-
+    // layers, just full-window-sized + with real pixel data via Copy.
     //
-    // PreDestroy doesn't need to RemoveCanvas explicitly — when the wnd's
-    // dtor runs, ~CWnd Releases the parent layer which transitively
-    // releases its inserted canvases. We never AddRef the bg manually so
-    // there's no extra ref to balance.
-    DEBUG_MESSAGE("MonsterBook_CreateLayer: loading bg canvas");
+    // Lifetime: store in g_pBgLayer (file-scope smart-ptr, single
+    // MonsterBook instance via DAT_00c6f010 gating). PreDestroy clears
+    // it; next Construct overwrites (which Releases the previous via
+    // operator=).
+    DEBUG_MESSAGE("MonsterBook_CreateLayer: building bg overlay layer");
     try {
-        // Step A: Resolve the WZ canvas and probe its dims. If the resolve
-        // succeeded the canvas should have non-zero width/height; zero
-        // dims would mean the WZ entry is degenerate / not a real canvas.
         IWzCanvasPtr pBgCanvas = get_unknown(get_rm()->GetObjectA(
             Ztl_bstr_t(L"UI/UIWindow.img/MonsterBook/backgrnd")));
         if (!pBgCanvas) {
-            DEBUG_MESSAGE("  bg canvas resolved to NULL — UOL missing or QI failed");
+            DEBUG_MESSAGE("  bg WZ canvas resolved to NULL — aborting bg-layer build");
         } else {
-            DEBUG_MESSAGE("  bg canvas resolved: pBgCanvas=0x%08X w=%lu h=%lu cx=%ld cy=%ld",
+            DEBUG_MESSAGE("  bg WZ canvas: 0x%08X w=%lu h=%lu cx=%ld cy=%ld",
                           pBgCanvas.GetInterfacePtr(),
                           static_cast<unsigned long>(pBgCanvas->width),
                           static_cast<unsigned long>(pBgCanvas->height),
                           static_cast<long>(pBgCanvas->cx),
                           static_cast<long>(pBgCanvas->cy));
 
-            // Step B: Probe the parent layer's visibility — if it's hidden
-            // for any reason no inserted canvas will appear.
-            DEBUG_MESSAGE("  parentLayer visible=%ld z=%ld color=0x%08lX",
-                          static_cast<long>(pParentLayer->visible),
-                          static_cast<long>(pParentLayer->z),
-                          static_cast<unsigned long>(pParentLayer->color));
+            const unsigned long bgWidth  = pBgCanvas->width;
+            const unsigned long bgHeight = pBgCanvas->height;
 
-            // Step C: InsertCanvas direct reference into the parent layer.
-            // KMST's pattern would have CUIWnd's bg-canvas mechanism handle
-            // this via m_sBackgrndUOL, but that path didn't draw in the
-            // previous session's experiments so we mirror the
-            // temporarystat.cpp approach instead.
-            pParentLayer->InsertCanvas(pBgCanvas);
-            DEBUG_MESSAGE("  bg canvas inserted into parent layer (direct ref)");
+            IWzGr2DLayerPtr pBgLayer = pGr->CreateLayer(
+                /*nLeft=*/0, /*nTop=*/0,
+                /*uWidth=*/0, /*uHeight=*/0,
+                /*nZ=*/0, vtEmpty, vFilter);
+            if (!pBgLayer) {
+                DEBUG_MESSAGE("  bg-layer CreateLayer returned NULL");
+            } else {
+                DEBUG_MESSAGE("  bg-layer CreateLayer ok: 0x%08X",
+                              pBgLayer.GetInterfacePtr());
 
-            // Step D: ALSO copy the bg pixels into LAYER[0]'s canvas as a
-            // defensive backup — temporarystat.cpp does the Copy-into-fresh
-            // pattern for its skill cooldown shadows. If the parent-layer
-            // insert above doesn't render (for whatever wnd-internal
-            // reason), the LAYER[0] copy will at least produce visible
-            // pixels in the (40, 25)..(214, 281) rect.
-            //
-            // We pick LAYER[0]'s slot (+0x15A4) since it's the LeftLayer
-            // and its canvas is 174x256 — fits inside the bg's expected
-            // 475x349 footprint when the bg is cropped to the layer's
-            // origin offset of (40, 25). The bg covers the WHOLE wnd so
-            // copying its top-left 174x256 region gives us the upper-left
-            // chunk of the bg art.
-            auto** pSlot = reinterpret_cast<IWzGr2DLayer**>(
-                pBytes + 0x15A4);
-            if (*pSlot != nullptr) {
-                // Look up the canvas attached to LAYER[0]. We Created it
-                // empty earlier; now Copy() the bg pixels into it.
-                IWzGr2DLayerPtr pL0(*pSlot, /*fAddRef=*/true);
-                IWzCanvasPtr pL0Canvas = pL0->canvas[0L];
-                if (pL0Canvas) {
-                    DEBUG_MESSAGE("  L0 canvas at index 0: 0x%08X",
-                                  pL0Canvas.GetInterfacePtr());
-                    pL0Canvas->Copy(0, 0, pBgCanvas);
-                    DEBUG_MESSAGE("  L0 canvas Copy(0,0,bg) ok");
-                } else {
-                    DEBUG_MESSAGE("  L0 canvas at index 0 is NULL");
-                }
+                pBgLayer->origin = vParent;
+                pBgLayer->overlay = vParent;
+                pBgLayer->color = 0xFFFFFFFFUL;
+                pBgLayer->z = parentZ;  // parent's z — under sub-layers
+                DEBUG_MESSAGE("  bg-layer configured: origin/overlay=parent z=%ld",
+                              parentZ);
+
+                IWzCanvasPtr pBgLayerCanvas;
+                PcCreateObject<IWzCanvasPtr>(L"Canvas", pBgLayerCanvas, nullptr);
+                pBgLayerCanvas->Create(bgWidth, bgHeight);
+                pBgLayerCanvas->cx = 0;
+                pBgLayerCanvas->cy = 0;
+                DEBUG_MESSAGE("  bg-layer canvas: 0x%08X created %lux%lu",
+                              pBgLayerCanvas.GetInterfacePtr(),
+                              bgWidth, bgHeight);
+
+                pBgLayerCanvas->Copy(0, 0, pBgCanvas);
+                DEBUG_MESSAGE("  bg-layer canvas Copy(0,0,bg) ok");
+
+                pBgLayer->InsertCanvas(pBgLayerCanvas);
+                DEBUG_MESSAGE("  bg-layer InsertCanvas ok");
+
+                // Store ref-owning smart-ptr at file scope so the layer
+                // outlives this function. operator= here Releases any
+                // previous bg layer (e.g. from a prior open we didn't
+                // PreDestroy cleanly).
+                g_pBgLayer = pBgLayer;
+                DEBUG_MESSAGE("  bg-layer stored in g_pBgLayer");
             }
         }
     } catch (const _com_error& e) {
-        DEBUG_MESSAGE("  bg-canvas load/insert threw HRESULT 0x%08X (%s)",
+        DEBUG_MESSAGE("  bg-layer build threw HRESULT 0x%08X (%s)",
                       static_cast<unsigned>(e.Error()), e.ErrorMessage());
     }
 }
@@ -593,6 +599,15 @@ static void MonsterBook_Construct(void* pThis) {
 static void MonsterBook_PreDestroy(void* pThis) {
     DEBUG_MESSAGE("MonsterBook_PreDestroy: enter pThis=0x%08X", pThis);
     auto* pBytes = static_cast<uint8_t*>(pThis);
+
+    // Release the file-scope bg-layer first — it's parented to the wnd's
+    // parent layer via overlay, so dropping our ref now Disconnects it
+    // before the wnd dtor tears down the parent.
+    if (g_pBgLayer) {
+        DEBUG_MESSAGE("  releasing g_pBgLayer ptr=0x%08X",
+                      g_pBgLayer.GetInterfacePtr());
+        g_pBgLayer = nullptr;
+    }
 
     static constexpr size_t kLayerSlotOffsets[] = { 0x15A4, 0x15AC, 0x15B4 };
     for (auto offset : kLayerSlotOffsets) {
