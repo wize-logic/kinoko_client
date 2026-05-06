@@ -270,34 +270,30 @@ void __fastcall CWvsContext__UI_Open_hook(void* pThis, void* /*EDX*/,
 
 void __fastcall CWvsContext__UI_Close_hook(void* pCtx, void* /*EDX*/, int nUIType) {
     if (nUIType == 9) {  // MONSTERBOOK
-        // X-button → CUIWnd::OnButtonClicked(1000) → CWvsContext::UI_Close(9).
-        // v95's case-9 close handler gates on CWvsContext+0x3EB4 which we
-        // never set, so the original handler would no-op anyway. Run our
-        // teardown directly and skip the tail-call.
-        if (g_pMonsterBookUI) {
-            DEBUG_MESSAGE("CUIMonsterBook close: 0x%08X", g_pMonsterBookUI);
-            // Pull the window out of every CWndMan list it sits in. These
-            // four calls are the same sequence FUN_009b0e50 (the v95
-            // case-9 close prefs-save) makes at its tail; after they run
-            // the wnd manager skips our window on the next iteration.
-            // Pure list-remove — no callbacks into our vtable, safe to
-            // call from inside the click handler.
-            reinterpret_cast<void(__cdecl*)(void*)>(kCWndMan_RemoveWindow)(
-                g_pMonsterBookUI);
-            reinterpret_cast<void(__cdecl*)(void*)>(kCWndMan_RemoveUpdateWindow)(
-                g_pMonsterBookUI);
-            reinterpret_cast<void(__cdecl*)(void*)>(kCWndMan_RemoveInvalidatedWindow)(
-                g_pMonsterBookUI);
-            if (auto* pWndMan = CWndMan::GetInstance()) {
-                reinterpret_cast<void(__thiscall*)(void*, void*)>(
-                    kCWndMan_UnregisterUIWindow)(pWndMan, g_pMonsterBookUI);
-            }
-            // Defer the actual buffer free until the next UI_Open. Freeing
-            // here would return into the now-released close button.
-            g_pMonsterBookPendingFree = g_pMonsterBookUI;
-            g_pMonsterBookUI = nullptr;
-            g_pV95MonsterBookGlobal = nullptr;
-        }
+        // KNOWN LIMITATION (Phase 2-port-1.1): clicking the close X fires
+        // CUIWnd::OnButtonClicked(1000) -> CWvsContext::UI_Close(9), which
+        // lands here with the click handler still on the stack. None of
+        // the candidate teardown sequences we've tried hide the window
+        // visually:
+        //   - CUIWnd::OnDestroy (0x008DD380): position-save helper, not
+        //     a wnd-manager unregister.
+        //   - CWndMan::RemoveWindow / RemoveUpdate / RemoveInvalidated /
+        //     UnregisterUIWindow (the FUN_009b0e50 tail sequence): no-op
+        //     for us because the find-by-CWnd-pointer step doesn't locate
+        //     us — the window was never registered in those lists.
+        //   - Synchronous ZAllocEx::s_Free: returns into the freed close
+        //     button, ACCESS_VIOLATION reading a corrupt vtable.
+        // Net: stock v95 hides UIs through the deferred-Release path on
+        // their CWvsContext per-UI ZRef slot, which never got allocated
+        // for case 9 (the slot at CWvsContext+0x3EB4 is dead in v95).
+        // Reproducing that path requires either porting the per-UI ZRef
+        // setup (and the matching Release queue), or finding the actual
+        // wnd-manager list our window sits in to remove from.
+        //
+        // Until that's understood: do nothing on close. The window stays
+        // visible after click-X; subsequent /book is a no-op (the global
+        // is still set). Logout clears the singleton naturally. This
+        // keeps us crash-free while the next slice (CreateLayer) lands.
         return;
     }
     reinterpret_cast<void(__thiscall*)(void*, int)>(CWvsContext__UI_Close)(
