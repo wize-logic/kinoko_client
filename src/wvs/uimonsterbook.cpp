@@ -4,6 +4,7 @@
 #include "ztl/ztl.h"
 #include "wvs/uimonsterbook.h"
 #include "wvs/ctrlwnd.h"
+#include "wvs/layoutman.h"
 #include "wvs/wnd.h"
 
 #include <cstring>
@@ -69,6 +70,16 @@ namespace {
     // UI_Open's "already open" gate reads the slot directly so this is
     // just a friendly handle for the close-side log line.
     void* g_pMonsterBookUI = nullptr;
+
+    // Layer manager for the MonsterBook UI's background + sprite layers.
+    // Allocated on UI open, populated by MonsterBook_CreateLayer with
+    // AddLayer calls (one per WZ canvas), freed on UI close. Outlives
+    // MonsterBook_Construct because the layers it owns must persist for
+    // the wnd's lifetime — a stack-local CLayoutMan would Release the
+    // layers as soon as Construct returned. There is at most one
+    // MonsterBook UI open at a time (the v95 ZRef slot at +0x3EB4
+    // gates re-opens), so a single global ptr suffices.
+    CLayoutMan* g_pMonsterBookLayoutMan = nullptr;
 }
 
 
@@ -144,19 +155,47 @@ static void MonsterBook_CreateCtrl(void* pThis) {
 }
 
 // KMST 0x00848C8A (601 lines) — tools/decomp/cache_kmst/00848c8a.c.
-// Builds the 3 LAYER child controls at v95 +0x15A0..+0x15B8 (8 bytes each).
-// Each LAYER is dirty-flag-driven by UpdateUI which writes 1 to the first
-// field on every refresh.
+// KMST builds 3 LAYERs via raw IWzGr2D::CreateLayer + InsertCanvas dances —
+// 601 lines of COM error-checking and variant juggling. v95 ships a much
+// simpler helper: CLayoutMan::AddLayer at 0x005CDB70 (sUOL, z, bManaged)
+// wraps the entire pattern as a single call, used by surviving v95 UIs
+// like CUIUnreleaseDlg::OnCreate (verified caller via decomp.py callers).
 //
-// DEFERRED Phase 2-port-2: heavy COM body (IWzGr2D::CreateLayer / IWzGr2DLayer
-// / _variant_t / ZComAPI::ZComVariantClear / vtable-indexed calls into
-// IWzGr2DLayer at vtbl+0x64). Each COM helper's v95 address must be
-// verified before this can run — _g_gr, vtMissing, the IWzGr2D / IWzGr2DLayer
-// vtables, ZComAPI thunks. Until landed, the 3 LAYER slots stay zero,
-// UpdateUI's writes of `1` to +0x15A0/+0x15A8/+0x15B0 are harmless (just dirty
-// flags), and no draw output appears for the per-tab card grid / mob viewer.
-static void MonsterBook_CreateLayer(void* /*pThis*/) {
-    // TODO Phase 2-port-2.
+// The kinoko port substitutes that helper. Each AddLayer reads a WZ canvas
+// at the given UOL, builds an IWzGr2DLayer from it, and attaches it as a
+// child of the parent CWnd's layer at the supplied z. CLayoutMan stores
+// IWzGr2DLayerPtr in m_aLayer; ~CLayoutMan releases all of them in one
+// shot when we delete the CLayoutMan in MonsterBook_PreDestroy.
+//
+// SCOPE: this only loads the static MonsterBook artwork (window frame +
+// sprite sheets verified in UI.wz/UIWindow.img/MonsterBook). It does NOT
+// reproduce KMST's full 3-LAYER architecture — those LAYERs back per-tab
+// dynamic compositing (card-grid sprites blitted on dirty refresh, mob
+// viewer animation, cover-tab cycling). UpdateUI's writes of 1 to the
+// dirty flags at +0x15A0/+0x15A8/+0x15B0 still hit empty slots and are
+// harmless. Per-tab card sprites won't render until the deferred
+// CreateCardTable + a follow-up "draw cards into a managed layer" slice
+// land.
+static void MonsterBook_CreateLayer(void* pThis) {
+    if (g_pMonsterBookLayoutMan != nullptr) {
+        // Defensive: should have been cleaned in PreDestroy.
+        delete g_pMonsterBookLayoutMan;
+        g_pMonsterBookLayoutMan = nullptr;
+    }
+    g_pMonsterBookLayoutMan = new CLayoutMan();
+    if (!g_pMonsterBookLayoutMan) {
+        DEBUG_MESSAGE("CUIMonsterBook CLayoutMan alloc failed");
+        return;
+    }
+    g_pMonsterBookLayoutMan->Init(reinterpret_cast<CWnd*>(pThis), 0, 0);
+
+    // Window frame artwork. z=0 is below the buttons (which render via
+    // CCtrlButton's separate child-control path, on top of layers).
+    // bManaged=0 leaves the layer entirely owned by CLayoutMan::m_aLayer
+    // (avoids the global-current-layer slot at FUN_004356E0 used for
+    // active-bg tracking on full-screen UIs).
+    g_pMonsterBookLayoutMan->AddLayer(
+        L"UI/UIWindow.img/MonsterBook/backgrnd", 0, 0);
 }
 
 // KMST 0x0084988E (32 lines) — tools/decomp/cache_kmst/0084988e.c.
@@ -283,6 +322,14 @@ static void MonsterBook_PreDestroy(void* pThis) {
         auto* pSlot = reinterpret_cast<ZRef<CCtrlButton>*>(
             static_cast<uint8_t*>(pThis) + offset);
         *pSlot = nullptr;
+    }
+
+    // Release every layer we attached in CreateLayer. ~CLayoutMan walks
+    // m_aLayer and Releases each IWzGr2DLayerPtr; once the parent CWnd's
+    // layer drops its child ref too the layers free entirely.
+    if (g_pMonsterBookLayoutMan != nullptr) {
+        delete g_pMonsterBookLayoutMan;
+        g_pMonsterBookLayoutMan = nullptr;
     }
 }
 
