@@ -3,6 +3,8 @@
 #include "debug.h"
 #include "ztl/ztl.h"
 #include "wvs/uimonsterbook.h"
+#include "wvs/ctrlwnd.h"
+#include "wvs/wnd.h"
 
 #include <cstring>
 
@@ -81,10 +83,51 @@ namespace {
 //   +0x1590  ZRef<CCtrlButton>  id=0x7D3   pos (0x10E,0x11D)
 //   +0x1598  ZRef<CCtrlButton>  id=0x7D4   pos (0x197,0x11D)
 //   +0x1570  ZRef<CCtrlEdit>    id=0x7D5   rect (0x31, 0x1E, 0x78, 0xF)
-// Each control gets `vtable[+0x28](this, id, pos_struct, 0)` to wire the
-// id+pos; CCtrlEdit takes a different vtable[+8] signature with a CREATEPARAM.
-static void MonsterBook_CreateCtrl(void* /*pThis*/) {
-    // TODO Phase 2-port-1.
+//
+// Phase 2-port-1 implements the 6 CCtrlButton allocations (close X + 5 nav).
+// The two CCtrlTab subclasses (CCtrlLPTab/CCtrlRPTab) are deferred — they
+// need a kinoko CCtrlTab wrapper plus the v95 vtable addresses for the LP/RP
+// subclasses, which v95 may have stripped along with the rest of the
+// CUIMonsterBook implementation. The CCtrlEdit search box is deferred too;
+// kinoko_client doesn't expose a CCtrlEdit class today.
+static void MonsterBook_CreateCtrl(void* pThis) {
+    struct ButtonSpec {
+        size_t   offset;   // v95-coord offset of the ZRef<CCtrlButton> slot
+        uint32_t id;
+        int32_t  x;
+        int32_t  y;
+    };
+    static constexpr ButtonSpec kButtons[] = {
+        { 0x0080, 1000,    0x1AD, 8     },  // CUIWnd::m_pBtClose — close X
+        { 0x1578, 2000,    0x0AF, 0x1D  },  // KMST CreateCtrl button #2
+        { 0x1580, 0x07D1,  0x030, 0x11D },  // tab nav 1
+        { 0x1588, 0x07D2,  0x0B9, 0x11D },  // tab nav 2
+        { 0x1590, 0x07D3,  0x10E, 0x11D },  // tab nav 3
+        { 0x1598, 0x07D4,  0x197, 0x11D },  // tab nav 4
+    };
+
+    // KMST passes a CREATEPARAM with bAcceptFocus=1, everything else zero —
+    // local_28=1, local_24=0, local_20=0, local_1c=0 in the decomp at line 76-79.
+    CCtrlButton::CREATEPARAM cp;
+    cp.bAcceptFocus = 1;
+
+    auto* pParent = reinterpret_cast<CWnd*>(pThis);
+    for (const auto& spec : kButtons) {
+        auto* pBtn = new CCtrlButton();
+        if (!pBtn) {
+            DEBUG_MESSAGE("CCtrlButton alloc failed for id=%u", spec.id);
+            continue;
+        }
+        // Stash the new button into the ZRef slot. The slot is zero from
+        // the memset before MonsterBook_Construct, so operator= takes the
+        // _Release-of-null fast path then AddRef's the new button.
+        auto* pSlot = reinterpret_cast<ZRef<CCtrlButton>*>(
+            static_cast<uint8_t*>(pThis) + spec.offset);
+        *pSlot = pBtn;
+        // CreateCtrl(parent, id, l, t, decClickArea, pData) — KMST passes
+        // decClickArea=0 for every button.
+        pBtn->CreateCtrl(pParent, spec.id, spec.x, spec.y, 0, &cp);
+    }
 }
 
 // KMST 0x00848C8A (601 lines) — tools/decomp/cache_kmst/00848c8a.c.
@@ -142,15 +185,27 @@ static void MonsterBook_Construct(void* pThis) {
 }
 
 // Mirrors KMST CUIMonsterBook::~CUIMonsterBook + scalar_deleting_destructor.
-// PARTIAL: only frees the buffer. The CUIWnd ctor allocated the m_uiToolTip,
-// m_sBackgrndUOL, m_abOption, and m_pBtClose ZRef members inside the buffer;
-// without invoking v95 CUIWnd::~CUIWnd those leak ~50 bytes each open/close
-// cycle. v95 CUIWnd::~CUIWnd address is TBD — once a builder lands and we're
-// allocating real members, wire this up via the v95 dtor or by porting the
-// kinoko CUIWnd inline-dtor pattern from uiwnd.h:20-26.
+// PARTIAL: cleans up the Phase 2-port-1 buttons and frees the buffer. Still
+// missing: v95 CUIWnd::~CUIWnd cleanup of m_uiToolTip / m_sBackgrndUOL /
+// m_abOption (~30 bytes leaked per open/close until Phase 2-port-6).
 static void MonsterBook_Destroy(void* pThis) {
-    // TODO Phase 2-port-6: invoke v95 CUIWnd::~CUIWnd at <addr> + run any
-    // builder-specific cleanup once the Create* functions allocate things.
+    // Release the ZRef<CCtrlButton> slots populated by CreateCtrl. Setting
+    // each ZRef to nullptr triggers _Release on the underlying button so its
+    // refcount drops to 0 and the C++ delete path frees it via ZAllocEx.
+    // Mirrors the offsets in MonsterBook_CreateCtrl's kButtons table.
+    static constexpr size_t kBtnSlotOffsets[] = {
+        0x0080, 0x1578, 0x1580, 0x1588, 0x1590, 0x1598,
+    };
+    for (auto offset : kBtnSlotOffsets) {
+        auto* pSlot = reinterpret_cast<ZRef<CCtrlButton>*>(
+            static_cast<uint8_t*>(pThis) + offset);
+        *pSlot = nullptr;
+    }
+
+    // TODO Phase 2-port-6: invoke v95 CUIWnd::~CUIWnd at <addr> to clean up
+    // the CUIWnd-base allocations the v95 ctor made (m_uiToolTip /
+    // m_sBackgrndUOL / m_abOption). Then add release loops here for the
+    // builders that land (CreateLayer's LAYERs, CreateCardTable's grid, etc.).
     ZAllocEx<ZAllocAnonSelector>::s_Free(pThis);
 }
 
