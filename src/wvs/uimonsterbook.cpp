@@ -46,6 +46,7 @@ constexpr size_t kCUIMonsterBookSize = 0x18E0;
 //                 / OnMonsterBookSetCover gate on this for null-bail.
 constexpr uintptr_t kCUIWnd_ctor                          = 0x008DD680;
 constexpr uintptr_t kCUIWnd_CreateUIWndPosSaved           = 0x008DD300;
+constexpr uintptr_t kCUIWnd_OnCreate3                     = 0x008DDB30;
 constexpr uintptr_t kCWvsContext_UI_Open                  = 0x009D83F0;
 constexpr uintptr_t kCWvsContext_UI_Close                 = 0x009D5370;
 constexpr uintptr_t kCWvsContext_MonsterBookSlotPtr_Off   = 0x3EB4;
@@ -243,8 +244,33 @@ static void MonsterBook_Construct(void* pThis) {
         kCUIWnd_ctor)(pThis, 9, 0, 0, 0, 1, 0, 0);
 
     // CreateUIWndPosSaved(this, 0x1DB, 0x15D, 10) — 475x349 client area.
+    // Internally adds the wnd to the wnd manager which fires the OnCreate
+    // virtual at vtable[2] (= v95 CUIWnd::OnCreate(pData) at 0x008DDA90).
+    // That 1-arg variant defaults to an EMPTY bg UOL, so the window has
+    // no background art — what the user sees as the "blank book".
     reinterpret_cast<void(__thiscall*)(void*, int, int, int)>(
         kCUIWnd_CreateUIWndPosSaved)(pThis, 0x1DB, 0x15D, 10);
+
+    // Override the empty default by calling the 3-arg CUIWnd::OnCreate
+    // directly with the MonsterBook bg UOL. The 3-arg variant
+    // (FUN_008DDB30) reads its sUOL parameter (not m_sBackgrndUOL), so
+    // we synthesise a kinoko-side ZXString and pass it by value via
+    // reinterpret_cast — same pattern uiwnd.h already uses for the
+    // virtual override. The kinoko ZXString allocator
+    // (ZAllocStrSelector<wchar_t>) is wired to v95 0x00C6E64C in
+    // bypass.cpp, so the buffer is byte-compatible with v95's later
+    // dtor / re-assign paths.
+    //
+    // EXPERIMENTAL: if MonsterBook's bg actually renders via a custom
+    // LAYER (not the standard CUIWnd bg canvas), this load is a visual
+    // no-op and we'll need to wait for CreateLayer to land. Cheap to
+    // try since the WZ has UI/UIWindow.img/MonsterBook/backgrnd as a
+    // Canvas (verified via wz_search tree).
+    {
+        ZXString<wchar_t> sBgUOL(L"UI/UIWindow.img/MonsterBook/backgrnd");
+        reinterpret_cast<void(__thiscall*)(void*, void*, ZXString<wchar_t>, int32_t)>(
+            kCUIWnd_OnCreate3)(pThis, nullptr, sBgUOL, 0);
+    }
 
     // KMST's OnCreate runs the five builders here, then calls
     // CMonsterBookMan::GetCard(cover) and either CCtrlTab::SetTab(9) +
