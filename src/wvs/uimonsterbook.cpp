@@ -84,16 +84,49 @@ namespace {
 //   +0x1598  ZRef<CCtrlButton>  id=0x7D4   pos (0x197,0x11D)
 //   +0x1570  ZRef<CCtrlEdit>    id=0x7D5   rect (0x31, 0x1E, 0x78, 0xF)
 //
-// Phase 2-port-1 attempt: tried passing CREATEPARAM with empty sUOL — every
-// button crashes inside RESMAN.DLL on the immediate /book. KMST's CreateCtrl
-// fetches a UOL string from StringPool and assigns to CREATEPARAM.sUOL
-// BEFORE each CreateCtrl call; v95 CCtrlButton::CreateCtrl evidently
-// dereferences sUOL unconditionally and an empty/null path makes RESMAN
-// QueryInterface on a bad pointer. Reverted to stub until the StringPool
-// keys are mapped (the KMST decomp obscures the keys via Ghidra reuse of
-// `local_14` between the StringPool lookup and the prior CCtrlTab alloc).
-static void MonsterBook_CreateCtrl(void* /*pThis*/) {
-    // TODO Phase 2-port-1.
+// Phase 2-port-1 (retry): the previous attempt passed empty sUOL and crashed
+// in RESMAN.DLL. v95 CCtrlButton::CreateCtrl unconditionally loads the UOL
+// from CREATEPARAM, so each button needs a real UIWindow.img path. The four
+// UOLs (BtClose, BtSearch, arrowLeft, arrowRight) come from the v95
+// UI.wz/UIWindow.img/MonsterBook tree (verified via `wz_search tree UI.wz
+// UIWindow.img/MonsterBook`). KMST resolves the same four via StringPool
+// keys 0xAEF/0xAF0/0xAF1/0xAF2; arrowLeft and arrowRight repeat across the
+// two scroll-pair offsets.
+static void MonsterBook_CreateCtrl(void* pThis) {
+    struct ButtonSpec {
+        size_t         offset;   // v95-coord offset of the ZRef<CCtrlButton> slot
+        uint32_t       id;
+        int32_t        x;
+        int32_t        y;
+        const wchar_t* sUOL;
+    };
+    static const ButtonSpec kButtons[] = {
+        { 0x0080, 1000,    0x1AD, 8,     L"UIWindow.img/MonsterBook/BtClose"    },
+        { 0x1578, 2000,    0x0AF, 0x1D,  L"UIWindow.img/MonsterBook/BtSearch"   },
+        { 0x1580, 0x07D1,  0x030, 0x11D, L"UIWindow.img/MonsterBook/arrowLeft"  },
+        { 0x1588, 0x07D2,  0x0B9, 0x11D, L"UIWindow.img/MonsterBook/arrowRight" },
+        { 0x1590, 0x07D3,  0x10E, 0x11D, L"UIWindow.img/MonsterBook/arrowLeft"  },
+        { 0x1598, 0x07D4,  0x197, 0x11D, L"UIWindow.img/MonsterBook/arrowRight" },
+    };
+
+    auto* pParent = reinterpret_cast<CWnd*>(pThis);
+    for (const auto& spec : kButtons) {
+        auto* pBtn = new CCtrlButton();
+        if (!pBtn) {
+            DEBUG_MESSAGE("CCtrlButton alloc failed for id=%u", spec.id);
+            continue;
+        }
+        // Fresh CREATEPARAM per button — sUOL ownership stays scoped to
+        // the CreateCtrl call. KMST passes bAcceptFocus=1, others zero.
+        CCtrlButton::CREATEPARAM cp;
+        cp.bAcceptFocus = 1;
+        cp.sUOL = spec.sUOL;
+
+        auto* pSlot = reinterpret_cast<ZRef<CCtrlButton>*>(
+            static_cast<uint8_t*>(pThis) + spec.offset);
+        *pSlot = pBtn;
+        pBtn->CreateCtrl(pParent, spec.id, spec.x, spec.y, 0, &cp);
+    }
 }
 
 // KMST 0x00848C8A (601 lines) — tools/decomp/cache_kmst/00848c8a.c.
@@ -151,15 +184,26 @@ static void MonsterBook_Construct(void* pThis) {
 }
 
 // Mirrors KMST CUIMonsterBook::~CUIMonsterBook + scalar_deleting_destructor.
-// PARTIAL: only frees the buffer. The CUIWnd ctor allocated the m_uiToolTip,
-// m_sBackgrndUOL, m_abOption, and m_pBtClose ZRef members inside the buffer;
-// without invoking v95 CUIWnd::~CUIWnd those leak ~50 bytes each open/close
-// cycle. v95 CUIWnd::~CUIWnd address is TBD — once a builder lands and we're
-// allocating real members, wire this up via the v95 dtor or by porting the
-// kinoko CUIWnd inline-dtor pattern from uiwnd.h:20-26.
+// PARTIAL: cleans up the Phase 2-port-1 buttons and frees the buffer. Still
+// missing: v95 CUIWnd::~CUIWnd cleanup of m_uiToolTip / m_sBackgrndUOL /
+// m_abOption (~30 bytes leaked per open/close until Phase 2-port-6).
 static void MonsterBook_Destroy(void* pThis) {
-    // TODO Phase 2-port-6: invoke v95 CUIWnd::~CUIWnd at <addr> + run any
-    // builder-specific cleanup once the Create* functions allocate things.
+    // Release the ZRef<CCtrlButton> slots populated by CreateCtrl. Setting
+    // each ZRef to nullptr triggers _Release on the underlying button so its
+    // refcount drops to 0 and the C++ delete path frees it via ZAllocEx.
+    static constexpr size_t kBtnSlotOffsets[] = {
+        0x0080, 0x1578, 0x1580, 0x1588, 0x1590, 0x1598,
+    };
+    for (auto offset : kBtnSlotOffsets) {
+        auto* pSlot = reinterpret_cast<ZRef<CCtrlButton>*>(
+            static_cast<uint8_t*>(pThis) + offset);
+        *pSlot = nullptr;
+    }
+
+    // TODO Phase 2-port-6: invoke v95 CUIWnd::~CUIWnd at <addr> to clean up
+    // the CUIWnd-base allocations the v95 ctor made (m_uiToolTip /
+    // m_sBackgrndUOL / m_abOption). Then add release loops here for the
+    // builders that land (CreateLayer's LAYERs, CreateCardTable's grid, etc.).
     ZAllocEx<ZAllocAnonSelector>::s_Free(pThis);
 }
 
