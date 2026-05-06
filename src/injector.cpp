@@ -1,6 +1,7 @@
 #include "pch.h"
 #include "hook.h"
 #include "config.h"
+#include "debug.h"
 
 extern "C" __declspec(dllexport) VOID DummyExport() {}
 
@@ -65,6 +66,7 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
     switch (fdwReason) {
     case DLL_PROCESS_ATTACH:
         DisableThreadLibraryCalls(hinstDLL);
+        AttachDebugConsole();
         ProcessCommandLine();
         AttachSystemHooks();
         break;

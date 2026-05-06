@@ -10,3 +10,7 @@
 void DebugMessage(const char* pszFormat, ...);
 
 void ErrorMessage(const char* pszFormat, ...);
+
+// Spin up a stdout console so DebugMessage() lines are visible without a
+// debugger / DebugView. Call once from DllMain. No-op in release.
+void AttachDebugConsole();
