@@ -199,36 +199,39 @@ static void MonsterBook_CreateLayer(void* pThis) {
     }
     g_pMonsterBookLayoutMan->Init(reinterpret_cast<CWnd*>(pThis), 0, 0);
 
-    // Window frame artwork. z=0 is below the buttons (which render via
-    // CCtrlButton's separate child-control path, on top of layers).
-    // bManaged=0 leaves the layer entirely owned by CLayoutMan::m_aLayer.
-    //
-    // Use AddSingleLayer (FUN_005CDCB0) instead of AddLayer (FUN_005CDB70):
-    // AddLayer routes through CAnimationDisplayer::LoadLayer which expects
-    // a Property root with animation frames (like UI buttons or Effect
-    // sprites), and returns null when handed a single-Canvas UOL.
-    // AddSingleLayer routes through FUN_0044C0C0 instead, which loads a
-    // single static Canvas — exactly what UI/UIWindow.img/MonsterBook/backgrnd
-    // is per wz_search (Canvas, 0 sub-properties).
+    // === Diagnostic A: probe the WZ resolver directly =====================
+    // PcCreateObject is what KMST's CreateLayer uses to load static
+    // canvases. If the UOL resolves, we get a non-null IWzCanvas. If it
+    // doesn't, the path itself is wrong (different namespace / archive
+    // alias / etc).
+    IWzCanvasPtr pBgCanvas;
+    PcCreateObject(L"UI/UIWindow.img/MonsterBook/backgrnd",
+                   pBgCanvas, nullptr);
+    DEBUG_MESSAGE("  PcCreateObject(canvas backgrnd) raw=0x%08X",
+                  *reinterpret_cast<void**>(&pBgCanvas));
+
+    // === Diagnostic B: AddSingleLayer on a known-Property UOL =============
+    // BtClose is the path our visible close-X button uses, so we know the
+    // archive + path resolve correctly. If AddSingleLayer succeeds on
+    // this Property but fails on the backgrnd Canvas, the loader expects
+    // a Property root (sub-canvases for frames) and a single-Canvas leaf
+    // can't be wrapped as a layer through this path. Different workaround
+    // needed for true static canvases (likely PcCreateObject + manual
+    // IWzGr2DLayer::InsertCanvas like KMST).
+    IWzGr2DLayerPtr btCloseLayer;
+    reinterpret_cast<IWzGr2DLayerPtr*(__thiscall*)(CLayoutMan*, IWzGr2DLayerPtr*, const wchar_t*, int32_t, int32_t)>(
+        0x005CDCB0)(g_pMonsterBookLayoutMan, std::addressof(btCloseLayer),
+                    L"UI/UIWindow.img/MonsterBook/BtClose", 0, 0);
+    DEBUG_MESSAGE("  AddSingleLayer(\"BtClose\" Property) raw=0x%08X",
+                  *reinterpret_cast<void**>(&btCloseLayer));
+
+    // === Diagnostic C: original AddSingleLayer for the bg ================
     IWzGr2DLayerPtr layer;
     reinterpret_cast<IWzGr2DLayerPtr*(__thiscall*)(CLayoutMan*, IWzGr2DLayerPtr*, const wchar_t*, int32_t, int32_t)>(
         0x005CDCB0)(g_pMonsterBookLayoutMan, std::addressof(layer),
                     L"UI/UIWindow.img/MonsterBook/backgrnd", 0, 0);
-
-    // IWzGr2DLayerPtr is a 4-byte _com_ptr_t<IWzGr2DLayer> wrapper.
-    void* pRawLayer = *reinterpret_cast<void**>(&layer);
-    DEBUG_MESSAGE("  AddSingleLayer(\"backgrnd\", z=0, bManaged=0) -> raw=0x%08X",
-                  pRawLayer);
-
-    // Push the layer into the CLayoutMan's m_aLayer ZArray so ~CLayoutMan
-    // releases it on close. AddSingleLayer doesn't auto-store like
-    // AddLayer's m_aLayer push did (we bypassed the kinoko wrapper for
-    // the raw call).
-    if (pRawLayer != nullptr) {
-        // TODO: store via ZArray::InsertBefore once the CLayoutMan
-        // wrapper exposes it. For now we leak a single layer ref per
-        // open/close cycle — small and fixed-cost.
-    }
+    DEBUG_MESSAGE("  AddSingleLayer(\"backgrnd\" Canvas) raw=0x%08X",
+                  *reinterpret_cast<void**>(&layer));
 }
 
 // KMST 0x0084988E (32 lines) — tools/decomp/cache_kmst/0084988e.c.
