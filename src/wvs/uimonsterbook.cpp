@@ -381,23 +381,45 @@ static void MonsterBook_CreateLayer(void* pThis) {
     // the InsertCanvas AddRef'd, parent layer holds the ref; ~CWnd Releases
     // the parent layer which transitively releases this canvas. No PreDestroy
     // cleanup needed.
-    DEBUG_MESSAGE("MonsterBook_CreateLayer: inserting empty canvas into parent layer for path-B GetCanvas");
+    DEBUG_MESSAGE("MonsterBook_CreateLayer: populate parent-layer canvas + Copy bg into it");
     try {
-        IWzCanvasPtr pParentCanvas;
-        PcCreateObject<IWzCanvasPtr>(L"Canvas", pParentCanvas, nullptr);
-        if (!pParentCanvas) {
-            DEBUG_MESSAGE("  PcCreateObject returned NULL parent canvas");
+        // Resolve the bg WZ canvas so we can Copy() its pixels in.
+        IWzCanvasPtr pBgCanvas = get_unknown(get_rm()->GetObjectA(
+            Ztl_bstr_t(L"UI/UIWindow.img/MonsterBook/backgrnd")));
+        if (!pBgCanvas) {
+            DEBUG_MESSAGE("  bg WZ canvas resolved to NULL");
         } else {
-            pParentCanvas->Create(0x1DB, 0x15D);
-            pParentCanvas->cx = 0;
-            pParentCanvas->cy = 0;
-            DEBUG_MESSAGE("  parent canvas Created 475x349, cx/cy=0: 0x%08X",
-                          pParentCanvas.GetInterfacePtr());
-            pParentLayer->InsertCanvas(pParentCanvas);
-            DEBUG_MESSAGE("  parent canvas InsertCanvas ok — CWnd::Draw GetCanvas should now return it");
+            DEBUG_MESSAGE("  bg WZ canvas: 0x%08X w=%lu h=%lu",
+                          pBgCanvas.GetInterfacePtr(),
+                          static_cast<unsigned long>(pBgCanvas->width),
+                          static_cast<unsigned long>(pBgCanvas->height));
+
+            IWzCanvasPtr pParentCanvas;
+            PcCreateObject<IWzCanvasPtr>(L"Canvas", pParentCanvas, nullptr);
+            if (!pParentCanvas) {
+                DEBUG_MESSAGE("  PcCreateObject returned NULL parent canvas");
+            } else {
+                pParentCanvas->Create(0x1DB, 0x15D);
+                pParentCanvas->cx = 0;
+                pParentCanvas->cy = 0;
+                DEBUG_MESSAGE("  parent canvas Created 475x349, cx/cy=0: 0x%08X",
+                              pParentCanvas.GetInterfacePtr());
+
+                // Copy bg pixels into the empty canvas. If parent-layer
+                // canvases render at all, this will show the full bg
+                // image. The previous v3 test (direct InsertCanvas of WZ
+                // canvas without Create+Copy) didn't render — so this is
+                // a focused test of whether the Create+Copy combination
+                // is the missing piece for parent-layer canvas rendering.
+                pParentCanvas->Copy(0, 0, pBgCanvas);
+                DEBUG_MESSAGE("  parent canvas Copy(0,0,bg) ok");
+
+                pParentLayer->InsertCanvas(pParentCanvas);
+                DEBUG_MESSAGE("  parent canvas InsertCanvas ok");
+            }
         }
     } catch (const _com_error& e) {
-        DEBUG_MESSAGE("  parent-canvas insert threw HRESULT 0x%08X (%s)",
+        DEBUG_MESSAGE("  parent-canvas build threw HRESULT 0x%08X (%s)",
                       static_cast<unsigned>(e.Error()), e.ErrorMessage());
     }
 }
