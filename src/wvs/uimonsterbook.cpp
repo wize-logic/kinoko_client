@@ -88,11 +88,16 @@ namespace {
 // and add 0xB08 (v95 sizeof(CUIWnd)) — net +0x6A0 — to get the v95
 // absolute offset.
 //
-// Status (2026-05-06 late-late): CreateCtrl + CreateLayer + CreateRect
-// are LANDED. CreateCardTable / CreateFontArray remain DEFERRED with
-// rationale in their function-level comments (gated on either a v95
-// enumeration helper that doesn't exist for cards-by-tab, or
-// StringPool IDs lost in Ghidra decomp for the font slots).
+// Status (2026-05-07): CreateCtrl + CreateLayer + CreateRect + CreateFontArray
+// are LANDED. CreateCardTable remains DEFERRED with rationale in its
+// function-level comment (3 converging blockers + invisible-without-DrawLeftLayer
+// payoff). CCtrlLPTab / CCtrlRPTab and the real DrawLeftLayer body remain
+// DEFERRED — see "CCtrlTab port investigation 2026-05-07" further down for
+// findings (multi-vtable layout, KMST CCtrlTab::CreateCtrl introduces a 4-arg
+// override at slot 10 incompatible with kinoko's CCtrlWnd vtable shape, +0xEC0
+// LP / +0xEC8 RP storage). Multi-session port; do NOT attempt without a
+// verified vtable layout matching v95's stripped CCtrlWnd shape — wrong slot
+// dispatch crashes the process.
 //
 // Per-builder logging: every builder emits DEBUG_MESSAGE markers on
 // entry/exit and around each significant call. With AttachDebugConsole
