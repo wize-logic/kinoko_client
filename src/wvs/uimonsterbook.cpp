@@ -177,6 +177,16 @@ static void MonsterBook_CreateCtrl(void* pThis) {
 // CreateCardTable + a follow-up "draw cards into a managed layer" slice
 // land.
 static void MonsterBook_CreateLayer(void* pThis) {
+    // Diagnostic: dump the wnd's layer state. CWnd::GetLayer reads
+    // *(this+0x18); if that's null, AddLayer's parent-layer lookup
+    // can't attach the new child. m_pLayer should be set by
+    // CWnd::PreCreateWnd (called via vtable[2] from FUN_009AD8F0
+    // inside CreateUIWndPosSaved).
+    void* pWndLayer = *reinterpret_cast<void**>(
+        static_cast<uint8_t*>(pThis) + 0x18);
+    DEBUG_MESSAGE("MonsterBook_CreateLayer: pThis=0x%08X m_pLayer@+0x18=0x%08X",
+                  pThis, pWndLayer);
+
     if (g_pMonsterBookLayoutMan != nullptr) {
         // Defensive: should have been cleaned in PreDestroy.
         delete g_pMonsterBookLayoutMan;
@@ -194,8 +204,16 @@ static void MonsterBook_CreateLayer(void* pThis) {
     // bManaged=0 leaves the layer entirely owned by CLayoutMan::m_aLayer
     // (avoids the global-current-layer slot at FUN_004356E0 used for
     // active-bg tracking on full-screen UIs).
-    g_pMonsterBookLayoutMan->AddLayer(
+    auto layer = g_pMonsterBookLayoutMan->AddLayer(
         L"UI/UIWindow.img/MonsterBook/backgrnd", 0, 0);
+
+    // IWzGr2DLayerPtr is a 4-byte _com_ptr_t<IWzGr2DLayer> wrapper —
+    // its first (and only) member is the raw IWzGr2DLayer*. A null
+    // raw means the load failed (canvas not found at UOL, or the
+    // parent layer was null).
+    void* pRawLayer = *reinterpret_cast<void**>(&layer);
+    DEBUG_MESSAGE("  AddLayer(\"backgrnd\", z=0, bManaged=0) -> raw=0x%08X",
+                  pRawLayer);
 }
 
 // KMST 0x0084988E (32 lines) — tools/decomp/cache_kmst/0084988e.c.
@@ -277,13 +295,21 @@ static void MonsterBook_CreateFontArray(void* /*pThis*/) {
 // Mirrors KMST CUIMonsterBook::CUIMonsterBook + OnCreate. Run on a fresh
 // kCUIMonsterBookSize buffer.
 static void MonsterBook_Construct(void* pThis) {
+    DEBUG_MESSAGE("MonsterBook_Construct entry: pThis=0x%08X", pThis);
+
     // CUIWnd::CUIWnd(this, 9, 0, 0, 0, 1, 0, 0) — args verbatim from KMST.
     reinterpret_cast<void(__thiscall*)(void*, int, int, int, int, int, int, int)>(
         kCUIWnd_ctor)(pThis, 9, 0, 0, 0, 1, 0, 0);
 
+    DEBUG_MESSAGE("  after CUIWnd::CUIWnd: m_pLayer@+0x18=0x%08X",
+                  *reinterpret_cast<void**>(static_cast<uint8_t*>(pThis) + 0x18));
+
     // CreateUIWndPosSaved(this, 0x1DB, 0x15D, 10) — 475x349 client area.
     reinterpret_cast<void(__thiscall*)(void*, int, int, int)>(
         kCUIWnd_CreateUIWndPosSaved)(pThis, 0x1DB, 0x15D, 10);
+
+    DEBUG_MESSAGE("  after CreateUIWndPosSaved: m_pLayer@+0x18=0x%08X",
+                  *reinterpret_cast<void**>(static_cast<uint8_t*>(pThis) + 0x18));
 
     // KMST's OnCreate runs the five builders here, then calls
     // CMonsterBookMan::GetCard(cover) and either CCtrlTab::SetTab(9) +
