@@ -147,26 +147,87 @@ static void MonsterBook_CreateCtrl(void* pThis) {
 // Builds the 3 LAYER child controls at v95 +0x15A0..+0x15B8 (8 bytes each).
 // Each LAYER is dirty-flag-driven by UpdateUI which writes 1 to the first
 // field on every refresh.
+//
+// DEFERRED Phase 2-port-2: heavy COM body (IWzGr2D::CreateLayer / IWzGr2DLayer
+// / _variant_t / ZComAPI::ZComVariantClear / vtable-indexed calls into
+// IWzGr2DLayer at vtbl+0x64). Each COM helper's v95 address must be
+// verified before this can run — _g_gr, vtMissing, the IWzGr2D / IWzGr2DLayer
+// vtables, ZComAPI thunks. Until landed, the 3 LAYER slots stay zero,
+// UpdateUI's writes of `1` to +0x15A0/+0x15A8/+0x15B0 are harmless (just dirty
+// flags), and no draw output appears for the per-tab card grid / mob viewer.
 static void MonsterBook_CreateLayer(void* /*pThis*/) {
     // TODO Phase 2-port-2.
 }
 
 // KMST 0x0084988E (32 lines) — tools/decomp/cache_kmst/0084988e.c.
-// Initialises the click-zone rectangles HitTest reads.
-static void MonsterBook_CreateRect(void* /*pThis*/) {
-    // TODO Phase 2-port-3.
+//
+// Two flat RECT arrays for HitTest:
+//   v95 +0x15B8: 25 RECTs (5x5 grid, cell size 0x21 x 0x2D, base (8, 0x1F),
+//                rect size 0x1B x 0x26)  — the per-tab card grid hit zones.
+//   v95 +0x1748: 20 RECTs (4x5 grid, cell size 0x24 x 0x24, base (0x26,
+//                0x3C), rect size 0x20 x 0x20) — the cover-tab card grid
+//                hit zones.
+// KMST calls the user32!SetRect import via DAT_00be6724; we link directly
+// against ::SetRect since <windows.h> is already in this TU.
+static void MonsterBook_CreateRect(void* pThis) {
+    auto* pBytes = static_cast<uint8_t*>(pThis);
+
+    auto* pTabRects = reinterpret_cast<RECT*>(pBytes + 0x15B8);
+    for (int i = 0; i < 25; ++i) {
+        const int x = (i % 5) * 0x21;
+        const int y = (i / 5) * 0x2D;
+        ::SetRect(&pTabRects[i], x + 8, y + 0x1F, x + 0x23, y + 0x45);
+    }
+
+    auto* pCoverRects = reinterpret_cast<RECT*>(pBytes + 0x1748);
+    for (int i = 0; i < 20; ++i) {
+        const int x = (i % 4) * 0x24;
+        const int y = (i / 4) * 0x24;
+        ::SetRect(&pCoverRects[i], x + 0x26, y + 0x3C, x + 0x46, y + 0x5C);
+    }
 }
 
 // KMST 0x0084991F (73 lines) — tools/decomp/cache_kmst/0084991f.c.
 // Allocates the 9-column ZArray<ZArray<ZRef<MonsterBookCard>>> at v95 +0x1888
 // (= KMST +0x11E8) — backing store for all collected cards by tab/area.
+//
+// DEFERRED Phase 2-port-4: KMST's body iterates `CMonsterBookMan::GetCard(p,
+// &out, tab, idx)` (the (long, long) overload at KMST 0x006823F1) to walk
+// each tab's card list. v95 stripped that overload — the v95 names cache
+// shows only the by-cardId GetCard at 0x00662930 (`?GetCard@CMonsterBookMan@@QBE
+// ?AV?$ZRef@UMonsterBookCard@@@@J@Z`, single `J` arg). Without the (tab, idx)
+// helper the population step has no enumeration source. v95's surviving
+// CUIMonsterBook::GetCard_1 (0x00808FB0) reads `*(this+0x1888 + tabIdx*4)`;
+// when the slot is zero (our memset state) it returns null cards and
+// downstream LoadMobInfo / draw paths render no sprites. That is the
+// current visual behaviour and it is non-crashing.
+//
+// To populate later we'd need to either find a v95-side enumeration helper
+// (ZMap iteration via GetHeadPosition+GetNext on the cardId hashmap exists,
+// but cards aren't tagged by tab in MonsterBookCard so that gives all-cards
+// ungrouped), or rebuild the per-tab arrays inside CMonsterBookMan ourselves
+// from WZ data at boot. Both paths are larger than this batch.
 static void MonsterBook_CreateCardTable(void* /*pThis*/) {
-    // TODO Phase 2-port-4.
+    // No-op: zero-initialised buffer is a valid "no cards loaded" state.
+    // GetCard_1 null-checks the per-tab slot before dereferencing, so empty
+    // tables are safe.
 }
 
 // KMST 0x00849A25 (199 lines) — tools/decomp/cache_kmst/00849a25.c.
 // Pre-loads IWzFont COM ptrs into the m_aFonts ZArray (+0xE64 v95 = KMST
 // +0x7C4 — the ctor zeros this slot, the builder fills it).
+//
+// DEFERRED Phase 2-port-5: 8-slot IWzFont com_ptr array sourced from
+// StringPool::GetStringW(<id>) → PcCreateObject for slots 0-1, then
+// IWzFont::Create with StringPool::GetBSTR-derived font names + sizes
+// for slots 2-7. Ghidra's signature inference loses the literal StringPool
+// IDs (they show as stack-pointer casts because GetStringW's first int
+// arg is misclassified). Without the IDs we can't replay the right
+// StringPool keys against v95's pool, so the fonts would resolve wrong.
+//
+// Safe to leave empty until CreateLayer lands: the font array is read by
+// LAYER draw paths to render labels; with no LAYERs constructed nothing
+// reads from this slot.
 static void MonsterBook_CreateFontArray(void* /*pThis*/) {
     // TODO Phase 2-port-5.
 }
@@ -197,28 +258,32 @@ static void MonsterBook_Construct(void* pThis) {
     MonsterBook_CreateFontArray(pThis);
 }
 
-// Mirrors KMST CUIMonsterBook::~CUIMonsterBook + scalar_deleting_destructor.
-// PARTIAL: cleans up the Phase 2-port-1 buttons and frees the buffer. Still
-// missing: v95 CUIWnd::~CUIWnd cleanup of m_uiToolTip / m_sBackgrndUOL /
-// m_abOption (~30 bytes leaked per open/close until Phase 2-port-6).
-static void MonsterBook_Destroy(void* pThis) {
-    // Release the ZRef<CCtrlButton> slots populated by CreateCtrl. Setting
-    // each ZRef to nullptr triggers _Release on the underlying button so its
-    // refcount drops to 0 and the C++ delete path frees it via ZAllocEx.
-    static constexpr size_t kBtnSlotOffsets[] = {
-        0x0080, 0x1578, 0x1580, 0x1588, 0x1590, 0x1598,
+// Pre-destroy hook — runs in our UI_Close hook BEFORE we tail-call v95's
+// stock UI_Close. v95's case-9 close path runs Release → virtual dtor →
+// ~CUIWnd → ~CWnd which cleans the CUIWnd-base members (m_pBtClose at
+// +0x80, m_uiToolTip, m_abOption, m_sBackgrndUOL) and unregisters the
+// window from the wnd manager. It does NOT know about derived members,
+// so any ZRef / heap allocations the builders added need to be released
+// here. Currently that means the 5 nav buttons populated by CreateCtrl
+// at +0x1578..+0x1598 (m_pBtClose at +0x80 belongs to the base — leave
+// it for ~CUIWnd).
+//
+// Setting each ZRef slot to nullptr triggers ZRef::operator=(nullptr_t)
+// which Releases the underlying button; if no other holder exists the
+// refcount drops to 0 and the C++ delete path frees it via ZAllocEx.
+//
+// Do NOT s_Free the buffer here — v95's scalar_deleting_dtor (reached
+// through the vtable Release call) does that, and an extra s_Free here
+// would double-free.
+static void MonsterBook_PreDestroy(void* pThis) {
+    static constexpr size_t kNavBtnSlotOffsets[] = {
+        0x1578, 0x1580, 0x1588, 0x1590, 0x1598,
     };
-    for (auto offset : kBtnSlotOffsets) {
+    for (auto offset : kNavBtnSlotOffsets) {
         auto* pSlot = reinterpret_cast<ZRef<CCtrlButton>*>(
             static_cast<uint8_t*>(pThis) + offset);
         *pSlot = nullptr;
     }
-
-    // TODO Phase 2-port-6: invoke v95 CUIWnd::~CUIWnd at <addr> to clean up
-    // the CUIWnd-base allocations the v95 ctor made (m_uiToolTip /
-    // m_sBackgrndUOL / m_abOption). Then add release loops here for the
-    // builders that land (CreateLayer's LAYERs, CreateCardTable's grid, etc.).
-    ZAllocEx<ZAllocAnonSelector>::s_Free(pThis);
 }
 
 
@@ -269,7 +334,21 @@ void __fastcall CWvsContext__UI_Open_hook(void* pCtx, void* /*EDX*/,
 
 void __fastcall CWvsContext__UI_Close_hook(void* pCtx, void* /*EDX*/, int nUIType) {
     if (nUIType == 9) {  // MONSTERBOOK
-        DEBUG_MESSAGE("CUIMonsterBook close: 0x%08X", g_pMonsterBookUI);
+        // Read the live slot rather than g_pMonsterBookUI: v95 may have
+        // cleared the latter through paths we don't observe, but the slot
+        // is the source of truth that v95's case-9 close path reads next.
+        auto** pSlot = reinterpret_cast<void**>(
+            static_cast<uint8_t*>(pCtx) + kCWvsContext_MonsterBookSlotPtr_Off);
+        void* pUI = *pSlot;
+        DEBUG_MESSAGE("CUIMonsterBook close: 0x%08X", pUI);
+
+        // Release builder-allocated members BEFORE the v95 dtor path runs.
+        // ~CUIWnd doesn't know about the 5 nav buttons we added at
+        // +0x1578..+0x1598, so they'd leak per close cycle without this.
+        if (pUI != nullptr) {
+            MonsterBook_PreDestroy(pUI);
+        }
+
         // Clear DAT_00c6f010 BEFORE the slot-clear runs the dtor — once
         // the buffer is freed, OnMonsterBookSetCard / SetCover would
         // deref freed memory if the global still pointed at it. Local
