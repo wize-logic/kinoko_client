@@ -462,19 +462,71 @@ static void MonsterBook_CreateCardTable(void* /*pThis*/) {
 // Pre-loads IWzFont COM ptrs into the m_aFonts ZArray (+0xE64 v95 = KMST
 // +0x7C4 — the ctor zeros this slot, the builder fills it).
 //
-// DEFERRED Phase 2-port-5: 8-slot IWzFont com_ptr array sourced from
-// StringPool::GetStringW(<id>) → PcCreateObject for slots 0-1, then
-// IWzFont::Create with StringPool::GetBSTR-derived font names + sizes
-// for slots 2-7. Ghidra's signature inference loses the literal StringPool
-// IDs (they show as stack-pointer casts because GetStringW's first int
-// arg is misclassified). Without the IDs we can't replay the right
-// StringPool keys against v95's pool, so the fonts would resolve wrong.
+// StringPool keys recovered via the Phase 2-port-5 cipher RE
+// (asdfstory/tools/scripts/kmst_string_decoder.py + kmst_strings_dump.tsv):
+//   0x649  → "Canvas#Font"  (PcCreateObject class name for slots 2-7)
+//   0x64A  → "BA"           (primary face BSTR for slots 3, 5, 7 — looks like
+//                            a placeholder; not a real Windows font face)
+//   0x1556 → "돋움" (Dotum)  (secondary BSTR for slots 2-7)
 //
-// Safe to leave empty until CreateLayer lands: the font array is read by
-// LAYER draw paths to render labels; with no LAYERs constructed nothing
-// reads from this slot.
-static void MonsterBook_CreateFontArray(void* /*pThis*/) {
-    // TODO Phase 2-port-5.
+// KMST's flow per slot: PcCreateObject(L"Canvas#Font") to instantiate a
+// COM IWzFont, then IWzFont::Create(face=L"BA"|L"돋움", size=12, color, ...)
+// with per-slot ARGB color (slots 2-3 red, 4-5 green, 6-7 blue) and per-slot
+// face combos (even slots use just 0x1556, odd slots use 0x64A primary +
+// 0x1556 fallback). Slots 0/1 use kinoko-side basic-font cache via
+// get_basic_font(1) and get_basic_font(0x43); see v95 0x0095F9D0.
+//
+// We populate the ZArray and run PcCreateObject for slots 2-7 so the COM
+// objects exist, but skip the IWzFont::Create face-binding step. Reasons:
+//   - "BA" and "돋움" won't resolve cleanly on a v95 GMS Windows install
+//     (KMST is Korean-locale; v95 GMS ships English).
+//   - Real face binding requires a 6-arg COM dispatch with VARIANT/BSTR
+//     marshalling (~20 LoC per slot); not worth replicating until DrawLeftLayer
+//     actually uses the slots.
+//   - DrawLeftLayer's text rendering will fall back to the system default
+//     when slots 2-7 are unbound, which on v95 GMS gives a sensible Latin
+//     glyph set.
+// Future work: if Korean rendering matters, inject Latin-equivalent face
+// strings into v95's StringPool via AttachStringPoolMod, then call
+// IWzFont::Create with the substituted BSTRs.
+static void MonsterBook_CreateFontArray(void* pThis) {
+    DEBUG_MESSAGE("MonsterBook_CreateFontArray: enter pThis=0x%08X", pThis);
+
+    auto* pBytes = static_cast<uint8_t*>(pThis);
+    auto* pFontArray = reinterpret_cast<ZArray<IWzFontPtr>*>(pBytes + 0xE64);
+
+    // Allocate 8 default-constructed nullptr smart-pointer slots.
+    pFontArray->Alloc(8);
+
+    // Slots 2-7: PcCreateObject<IWzFontPtr>(L"Canvas#Font") creates the COM
+    // object. Face binding via IWzFont::Create is intentionally skipped —
+    // see header comment for the rationale.
+    for (int i = 2; i < 8; i++) {
+        try {
+            PcCreateObject<IWzFontPtr>(L"Canvas#Font", (*pFontArray)[i], nullptr);
+            DEBUG_MESSAGE("  Slot %d PcCreateObject(L\"Canvas#Font\") ok", i);
+        } catch (const _com_error& e) {
+            DEBUG_MESSAGE("  Slot %d PcCreateObject(L\"Canvas#Font\") threw 0x%08X (%S)",
+                          i, e.Error(), e.ErrorMessage());
+            (*pFontArray)[i] = nullptr;
+        }
+    }
+
+    // Slots 0/1: v95 get_basic_font cache lookup. Signature:
+    //   _com_ptr_t<IWzFont>* __cdecl get_basic_font(_com_ptr_t<IWzFont>* out, FONT_TYPE);
+    // (The ABI returns the out-buffer pointer for chaining; the IWzFont smart
+    // pointer is constructed in-place at the out-buffer.)
+    using GetBasicFontFn = IWzFontPtr*(__cdecl*)(IWzFontPtr*, int32_t);
+    static auto get_basic_font = reinterpret_cast<GetBasicFontFn>(0x0095F9D0);
+
+    IWzFontPtr basic1, basic43;
+    get_basic_font(&basic1, 1);
+    get_basic_font(&basic43, 0x43);
+    (*pFontArray)[0] = basic1;
+    (*pFontArray)[1] = basic43;
+    DEBUG_MESSAGE("  Slots 0/1 populated via get_basic_font(1)/get_basic_font(0x43)");
+
+    DEBUG_MESSAGE("MonsterBook_CreateFontArray: exit");
 }
 
 
@@ -565,6 +617,18 @@ static void MonsterBook_PreDestroy(void* pThis) {
         auto* pEditSlot = reinterpret_cast<ZRef<CCtrlEdit>*>(pBytes + 0x1570);
         DEBUG_MESSAGE("  releasing ZRef<CCtrlEdit> @+0x1570");
         *pEditSlot = nullptr;
+    }
+
+    // m_aFonts ZArray<IWzFontPtr> @+0xE64 — release the 8 COM smart pointers
+    // populated by CreateFontArray. RemoveAll calls destruct<IWzFontPtr> on
+    // each slot (releases COM ref) then frees the backing buffer via the v95
+    // anon allocator. v95's stripped CUIMonsterBook dtor does NOT walk +0xE64
+    // so without this we'd leak 8 IWzFont COM refs per open/close cycle.
+    {
+        auto* pFontArray = reinterpret_cast<ZArray<IWzFontPtr>*>(pBytes + 0xE64);
+        DEBUG_MESSAGE("  releasing ZArray<IWzFontPtr> @+0xE64 (count=%u)",
+                      pFontArray->GetCount());
+        pFontArray->RemoveAll();
     }
     DEBUG_MESSAGE("MonsterBook_PreDestroy: done");
 }
