@@ -199,6 +199,13 @@ static void MonsterBook_CreateLayer(void* pThis) {
     }
     g_pMonsterBookLayoutMan->Init(reinterpret_cast<CWnd*>(pThis), 0, 0);
 
+    // Sanity-check: did Init actually set m_pWnd to our wnd? If not,
+    // the GetLayer call inside AddSingleLayer dereferences a null
+    // m_pWnd and returns null without obvious failure.
+    DEBUG_MESSAGE("  LayoutMan@0x%08X m_pWnd=0x%08X expected=0x%08X",
+                  g_pMonsterBookLayoutMan,
+                  g_pMonsterBookLayoutMan->m_pWnd, pThis);
+
     // === Diagnostic: AddSingleLayer on a known-Property UOL ================
     // BtClose is the path our visible close-X button uses, so we know the
     // archive + path resolve correctly. If AddSingleLayer succeeds on
