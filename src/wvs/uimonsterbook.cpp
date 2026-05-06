@@ -359,6 +359,47 @@ static void MonsterBook_CreateLayer(void* pThis) {
     }
 
     DEBUG_MESSAGE("MonsterBook_CreateLayer: all 3 layers built ok");
+
+    // ----- Empty parent-layer canvas for CWnd::Draw path B -----------------
+    //
+    // CWnd::Draw at 0x009AE5C0 path B (when *(this+0x78) != 0) calls
+    // FUN_0042B170 (= GetCanvas) which reads pParentLayer->canvas[0]. If
+    // the parent layer has no canvases, GetCanvas returns null and path B
+    // silently fails — which would explain why m_sBackgrndUOL + +0x78 are
+    // both populated but no bg renders. Last test confirmed +0x78 = a real
+    // pointer (0x790A1FF4) yet nothing visible; path B must be erroring.
+    //
+    // Fix: insert a fresh empty canvas sized to the wnd client area into
+    // the parent layer. Path B's GetCanvas will then return it as the draw
+    // destination; FUN_00401CF0(left, top, +0x78, &variant) draws the WZ
+    // bg canvas onto our empty canvas. The wnd-mgr then renders this
+    // canvas at the wnd's screen position alongside the children — buttons
+    // stay visible because they're separate child wnds, not occluded by
+    // the canvas living inside the layer.
+    //
+    // 475x349 = the wnd's client area set by CreateUIWndPosSaved. Lifetime:
+    // the InsertCanvas AddRef'd, parent layer holds the ref; ~CWnd Releases
+    // the parent layer which transitively releases this canvas. No PreDestroy
+    // cleanup needed.
+    DEBUG_MESSAGE("MonsterBook_CreateLayer: inserting empty canvas into parent layer for path-B GetCanvas");
+    try {
+        IWzCanvasPtr pParentCanvas;
+        PcCreateObject<IWzCanvasPtr>(L"Canvas", pParentCanvas, nullptr);
+        if (!pParentCanvas) {
+            DEBUG_MESSAGE("  PcCreateObject returned NULL parent canvas");
+        } else {
+            pParentCanvas->Create(0x1DB, 0x15D);
+            pParentCanvas->cx = 0;
+            pParentCanvas->cy = 0;
+            DEBUG_MESSAGE("  parent canvas Created 475x349, cx/cy=0: 0x%08X",
+                          pParentCanvas.GetInterfacePtr());
+            pParentLayer->InsertCanvas(pParentCanvas);
+            DEBUG_MESSAGE("  parent canvas InsertCanvas ok — CWnd::Draw GetCanvas should now return it");
+        }
+    } catch (const _com_error& e) {
+        DEBUG_MESSAGE("  parent-canvas insert threw HRESULT 0x%08X (%s)",
+                      static_cast<unsigned>(e.Error()), e.ErrorMessage());
+    }
 }
 
 // KMST 0x0084988E (32 lines) — tools/decomp/cache_kmst/0084988e.c.
