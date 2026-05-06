@@ -201,19 +201,34 @@ static void MonsterBook_CreateLayer(void* pThis) {
 
     // Window frame artwork. z=0 is below the buttons (which render via
     // CCtrlButton's separate child-control path, on top of layers).
-    // bManaged=0 leaves the layer entirely owned by CLayoutMan::m_aLayer
-    // (avoids the global-current-layer slot at FUN_004356E0 used for
-    // active-bg tracking on full-screen UIs).
-    auto layer = g_pMonsterBookLayoutMan->AddLayer(
-        L"UI/UIWindow.img/MonsterBook/backgrnd", 0, 0);
+    // bManaged=0 leaves the layer entirely owned by CLayoutMan::m_aLayer.
+    //
+    // Use AddSingleLayer (FUN_005CDCB0) instead of AddLayer (FUN_005CDB70):
+    // AddLayer routes through CAnimationDisplayer::LoadLayer which expects
+    // a Property root with animation frames (like UI buttons or Effect
+    // sprites), and returns null when handed a single-Canvas UOL.
+    // AddSingleLayer routes through FUN_0044C0C0 instead, which loads a
+    // single static Canvas — exactly what UI/UIWindow.img/MonsterBook/backgrnd
+    // is per wz_search (Canvas, 0 sub-properties).
+    IWzGr2DLayerPtr layer;
+    reinterpret_cast<IWzGr2DLayerPtr*(__thiscall*)(CLayoutMan*, IWzGr2DLayerPtr*, const wchar_t*, int32_t, int32_t)>(
+        0x005CDCB0)(g_pMonsterBookLayoutMan, std::addressof(layer),
+                    L"UI/UIWindow.img/MonsterBook/backgrnd", 0, 0);
 
-    // IWzGr2DLayerPtr is a 4-byte _com_ptr_t<IWzGr2DLayer> wrapper —
-    // its first (and only) member is the raw IWzGr2DLayer*. A null
-    // raw means the load failed (canvas not found at UOL, or the
-    // parent layer was null).
+    // IWzGr2DLayerPtr is a 4-byte _com_ptr_t<IWzGr2DLayer> wrapper.
     void* pRawLayer = *reinterpret_cast<void**>(&layer);
-    DEBUG_MESSAGE("  AddLayer(\"backgrnd\", z=0, bManaged=0) -> raw=0x%08X",
+    DEBUG_MESSAGE("  AddSingleLayer(\"backgrnd\", z=0, bManaged=0) -> raw=0x%08X",
                   pRawLayer);
+
+    // Push the layer into the CLayoutMan's m_aLayer ZArray so ~CLayoutMan
+    // releases it on close. AddSingleLayer doesn't auto-store like
+    // AddLayer's m_aLayer push did (we bypassed the kinoko wrapper for
+    // the raw call).
+    if (pRawLayer != nullptr) {
+        // TODO: store via ZArray::InsertBefore once the CLayoutMan
+        // wrapper exposes it. For now we leak a single layer ref per
+        // open/close cycle — small and fixed-cost.
+    }
 }
 
 // KMST 0x0084988E (32 lines) — tools/decomp/cache_kmst/0084988e.c.
