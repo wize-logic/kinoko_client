@@ -2,8 +2,10 @@
 #include "hook.h"
 #include "debug.h"
 #include "ztl/ztl.h"
+#include "ztl/zcom.h"
 #include "wvs/uimonsterbook.h"
 #include "wvs/ctrlwnd.h"
+#include "wvs/util.h"
 #include "wvs/wnd.h"
 
 #include <cstring>
@@ -72,19 +74,23 @@ namespace {
 }
 
 
-// === Builder stubs (Phase 2 ports — TODO) ===================================
+// === Builders ===============================================================
 //
-// Each stub records the KMST source it ports from. Offsets in the comments
-// are in KMST coordinates; subtract 0x468 (KMST sizeof(CUIWnd)) and add
-// 0xB08 (v95 sizeof(CUIWnd)) — net +0x6A0 — to get the v95 absolute offset.
+// Each builder records the KMST source it ports from. Offsets in the
+// comments are in KMST coordinates; subtract 0x468 (KMST sizeof(CUIWnd))
+// and add 0xB08 (v95 sizeof(CUIWnd)) — net +0x6A0 — to get the v95
+// absolute offset.
 //
-// All v95 helper addresses (CCtrlButton::CCtrlButton, CCtrlTab::CCtrlTab,
-// the CCtrlLPTab/CCtrlRPTab vtables, ZXString<wchar_t>::operator=, the
-// CCtrlEdit::CREATEPARAM ctor/dtor, etc.) need to be looked up before the
-// port can run. cuimonsterbook_xref.tsv in asdfstory tracks which are
-// known and which are TBD. The plan is one builder per follow-up commit so
-// each can be Windows-tested independently — fail-fast on the first one
-// that crashes.
+// Status (2026-05-06 late-late): CreateCtrl + CreateLayer + CreateRect
+// are LANDED. CreateCardTable / CreateFontArray remain DEFERRED with
+// rationale in their function-level comments (gated on either a v95
+// enumeration helper that doesn't exist for cards-by-tab, or
+// StringPool IDs lost in Ghidra decomp for the font slots).
+//
+// Per-builder logging: every builder emits DEBUG_MESSAGE markers on
+// entry/exit and around each significant call. With AttachDebugConsole
+// active in _DEBUG builds, the next Windows test transcript will show
+// exactly which builder ran how far.
 
 // KMST 0x008486DE (217 lines) — tools/decomp/cache_kmst/008486de.c.
 // Allocates 9 controls into v95-coord member offsets:
@@ -107,6 +113,8 @@ namespace {
 // keys 0xAEF/0xAF0/0xAF1/0xAF2; arrowLeft and arrowRight repeat across the
 // two scroll-pair offsets.
 static void MonsterBook_CreateCtrl(void* pThis) {
+    DEBUG_MESSAGE("MonsterBook_CreateCtrl: enter pThis=0x%08X", pThis);
+
     struct ButtonSpec {
         size_t         offset;   // v95-coord offset of the ZRef<CCtrlButton> slot
         uint32_t       id;
@@ -125,9 +133,12 @@ static void MonsterBook_CreateCtrl(void* pThis) {
 
     auto* pParent = reinterpret_cast<CWnd*>(pThis);
     for (const auto& spec : kButtons) {
+        DEBUG_MESSAGE("  button id=%u (0x%X) at +0x%X pos=(%d,%d) UOL=%S",
+                      spec.id, spec.id, static_cast<unsigned>(spec.offset),
+                      spec.x, spec.y, spec.sUOL);
         auto* pBtn = new CCtrlButton();
         if (!pBtn) {
-            DEBUG_MESSAGE("CCtrlButton alloc failed for id=%u", spec.id);
+            DEBUG_MESSAGE("    alloc failed");
             continue;
         }
         // Fresh CREATEPARAM per button — sUOL ownership stays scoped to
@@ -140,23 +151,214 @@ static void MonsterBook_CreateCtrl(void* pThis) {
             static_cast<uint8_t*>(pThis) + spec.offset);
         *pSlot = pBtn;
         pBtn->CreateCtrl(pParent, spec.id, spec.x, spec.y, 0, &cp);
+        DEBUG_MESSAGE("    button ok pBtn=0x%08X stored at +0x%X",
+                      pBtn, static_cast<unsigned>(spec.offset));
     }
+    DEBUG_MESSAGE("MonsterBook_CreateCtrl: 6 buttons populated");
 }
 
-// KMST 0x00848C8A (601 lines) — tools/decomp/cache_kmst/00848c8a.c.
-// Builds the 3 LAYER child controls at v95 +0x15A0..+0x15B8 (8 bytes each).
-// Each LAYER is dirty-flag-driven by UpdateUI which writes 1 to the first
-// field on every refresh.
+// KMST 0x00848C8A (601 lines) — tools/decomp/cache_kmst/00848c8a.c, full
+// verbatim port. Builds the 3 LAYER child controls at v95 +0x15A0..+0x15B8
+// (8 bytes each: 4-byte dirty flag + 4-byte raw IWzGr2DLayer*).
 //
-// DEFERRED Phase 2-port-2: heavy COM body (IWzGr2D::CreateLayer / IWzGr2DLayer
-// / _variant_t / ZComAPI::ZComVariantClear / vtable-indexed calls into
-// IWzGr2DLayer at vtbl+0x64). Each COM helper's v95 address must be
-// verified before this can run — _g_gr, vtMissing, the IWzGr2D / IWzGr2DLayer
-// vtables, ZComAPI thunks. Until landed, the 3 LAYER slots stay zero,
-// UpdateUI's writes of `1` to +0x15A0/+0x15A8/+0x15B0 are harmless (just dirty
-// flags), and no draw output appears for the per-tab card grid / mob viewer.
-static void MonsterBook_CreateLayer(void* /*pThis*/) {
-    // TODO Phase 2-port-2.
+// KMST builds the slots in order [0], [2], [1]. Each block runs:
+//   1. _g_gr->CreateLayer(left, top, 0, 0, 0, vtEmpty, dwFilter=0L)
+//   2. m_aLayer[i].pLayer = newLayer (raw COM ptr + AddRef)
+//   3. newLayer->origin  = parentLayerVariant      (vtbl+0x64 / IWzVector2D)
+//   4. newLayer->overlay = parentLayerVariant      (vtbl+0xFC / IWzGr2DLayer)
+//   5. newLayer->color   = 0xFFFFFFFF              (vtbl+0xE0)
+//   6. newLayer->z       = parentLayer->z + delta  (vtbl+0xB4)
+//   7. PcCreateObject<IWzCanvasPtr>(L"Canvas", &c)
+//      (KMST resolves the class name via StringPool::GetStringW(0x40A);
+//      verified via objdump at 0x848eac, 0x8492e6, 0x8496a2 — same key
+//      for all three blocks. The temporarystat.cpp / inlink.cpp callers
+//      already use L"Canvas" with the identical PcCreateObject + Create +
+//      put_cx/put_cy + InsertCanvas pattern.)
+//   8. canvas->Create(W, H); canvas->cx = 0; canvas->cy = 0
+//   9. newLayer->InsertCanvas(canvas) — VARIANTs default to vtEmpty
+//
+// Block 3 (LAYER[1]) is the "card grid" layer: 240x20 layer at (240, 20)
+// with a 220x290 canvas; the other two blocks share a 174x256 canvas at
+// (40, 25). z-deltas: LAYER[0]=+1, LAYER[1]=+2, LAYER[2]=+2 (LAYER[1] and
+// LAYER[2] share the same z; LAYER[2] is built later so it ends up on top
+// per insertion order).
+//
+// COM smart-pointer wrappers throw _com_error on FAILED HRESULT. We catch
+// at the body level so a single failure aborts the build cleanly without
+// crashing the host v95 client. DEBUG_MESSAGE between every step so the
+// next Windows test transcript shows exactly which call broke if any do.
+static void MonsterBook_CreateLayer(void* pThis) {
+    DEBUG_MESSAGE("MonsterBook_CreateLayer: enter pThis=0x%08X", pThis);
+
+    auto* pCWnd = reinterpret_cast<CWnd*>(pThis);
+    auto* pBytes = static_cast<uint8_t*>(pThis);
+
+    // CWnd::GetLayer (v95 0x0042A270) — returns the wnd's primary IWzGr2DLayer
+    // that we'll parent the 3 sub-layers under. Without it the put_origin /
+    // put_overlay calls have no anchor and the children float independently.
+    IWzGr2DLayerPtr pParentLayer;
+    try {
+        pParentLayer = pCWnd->GetLayer();
+    } catch (const _com_error& e) {
+        DEBUG_MESSAGE("  CWnd::GetLayer threw HRESULT 0x%08X (%s)",
+                      static_cast<unsigned>(e.Error()), e.ErrorMessage());
+        return;
+    }
+    if (!pParentLayer) {
+        DEBUG_MESSAGE("  CWnd::GetLayer returned NULL — wnd has no layer yet; aborting");
+        return;
+    }
+
+    // get_z on the parent — used to derive each child's absolute z.
+    long parentZ = 0;
+    try {
+        parentZ = pParentLayer->z;
+    } catch (const _com_error& e) {
+        DEBUG_MESSAGE("  parentLayer->z threw HRESULT 0x%08X (%s)",
+                      static_cast<unsigned>(e.Error()), e.ErrorMessage());
+        return;
+    }
+    DEBUG_MESSAGE("  parentLayer=0x%08X parentZ=%ld",
+                  pParentLayer.GetInterfacePtr(), parentZ);
+
+    // _g_gr at v95 0x00C6F430 — the global IWzGr2D singleton. Null if COM
+    // graphics not yet initialised (shouldn't happen this late in startup).
+    IWzGr2DPtr& pGr = get_gr();
+    if (!pGr) {
+        DEBUG_MESSAGE("  get_gr() (0x00C6F430) is NULL; aborting");
+        return;
+    }
+    DEBUG_MESSAGE("  _g_gr=0x%08X", pGr.GetInterfacePtr());
+
+    // VARIANT wrap of the parent layer — passed to put_origin and put_overlay.
+    // Ztl_variant_t(IUnknown*) AddRefs by default, so vParent owns one ref;
+    // dtor calls VariantClear which Releases.
+    Ztl_variant_t vParent(static_cast<IUnknown*>(pParentLayer.GetInterfacePtr()));
+    // KMST passes (long)0 with VT_I4 as the dwFilter (last arg of CreateLayer).
+    Ztl_variant_t vFilter(0L, VT_I4);
+
+    struct LayerSpec {
+        const char*   tag;
+        size_t        dirtyOffset;     // v95 offset of the dirty flag
+        size_t        slotOffset;      // v95 offset of the IWzGr2DLayer* slot
+        long          layerLeft;
+        long          layerTop;
+        long          zOffset;         // added to parentZ
+        unsigned long canvasWidth;
+        unsigned long canvasHeight;
+    };
+
+    // KMST build order: [0], [2], [1]. Each entry's offsets are v95-side
+    // (= KMST + 0x6A0). dirtyOffset is the int32_t flag UpdateUI re-arms;
+    // slotOffset is dirtyOffset+4 (the COM-ptr storage).
+    static const LayerSpec kLayers[] = {
+        { "L0", 0x15A0, 0x15A4, 0x28, 0x19, 1, 0xAE, 0x100 },
+        { "L2", 0x15B0, 0x15B4, 0x28, 0x19, 2, 0xAE, 0x100 },
+        { "L1", 0x15A8, 0x15AC, 0xF0, 0x14, 2, 0xDC, 0x122 },
+    };
+
+    for (const auto& spec : kLayers) {
+        DEBUG_MESSAGE("  [%s] begin: pos=(%ld,%ld) zDelta=%ld canvas=%lux%lu",
+                      spec.tag, spec.layerLeft, spec.layerTop, spec.zOffset,
+                      spec.canvasWidth, spec.canvasHeight);
+
+        // Step 1: pGr->CreateLayer(left, top, w=0, h=0, z=0, vCanvas=vtEmpty, dwFilter=0L)
+        //
+        // KMST calls width=0 height=0 — the layer auto-sizes to its inserted
+        // canvas. left/top are the layer's offset within the parent.
+        IWzGr2DLayerPtr pNewLayer;
+        try {
+            pNewLayer = pGr->CreateLayer(
+                spec.layerLeft, spec.layerTop,
+                /*uWidth=*/0, /*uHeight=*/0,
+                /*nZ=*/0, vtEmpty, vFilter);
+        } catch (const _com_error& e) {
+            DEBUG_MESSAGE("    pGr->CreateLayer threw HRESULT 0x%08X (%s)",
+                          static_cast<unsigned>(e.Error()), e.ErrorMessage());
+            return;
+        }
+        if (!pNewLayer) {
+            DEBUG_MESSAGE("    pGr->CreateLayer returned NULL");
+            return;
+        }
+        DEBUG_MESSAGE("    CreateLayer ok: pNewLayer=0x%08X",
+                      pNewLayer.GetInterfacePtr());
+
+        // Step 2: m_aLayer[i].pLayer = pNewLayer. The slot is a raw COM ptr
+        // (4 bytes) — emulate _com_ptr_t::operator=(p) by AddRef'ing the new
+        // ref before storing. Slot starts at nullptr (memset 0 in UI_Open).
+        IWzGr2DLayer* pRaw = pNewLayer.GetInterfacePtr();
+        pRaw->AddRef();
+        auto** pSlot = reinterpret_cast<IWzGr2DLayer**>(pBytes + spec.slotOffset);
+        *pSlot = pRaw;
+
+        // Steps 3-6: set parent-relative properties.
+        try {
+            pNewLayer->origin = vParent;
+            pNewLayer->overlay = vParent;
+            pNewLayer->color = 0xFFFFFFFFUL;
+            pNewLayer->z = parentZ + spec.zOffset;
+        } catch (const _com_error& e) {
+            DEBUG_MESSAGE("    layer property setters threw HRESULT 0x%08X (%s)",
+                          static_cast<unsigned>(e.Error()), e.ErrorMessage());
+            return;
+        }
+        DEBUG_MESSAGE("    layer configured: origin/overlay=parent color=0xFFFFFFFF z=%ld",
+                      parentZ + spec.zOffset);
+
+        // Step 7: PcCreateObject<IWzCanvasPtr>(L"Canvas", &out, NULL). Class
+        // name verified via KMST asm — StringPool key 0x40A maps to L"Canvas".
+        IWzCanvasPtr pCanvas;
+        try {
+            PcCreateObject<IWzCanvasPtr>(L"Canvas", pCanvas, nullptr);
+        } catch (const _com_error& e) {
+            DEBUG_MESSAGE("    PcCreateObject(L\"Canvas\") threw HRESULT 0x%08X (%s)",
+                          static_cast<unsigned>(e.Error()), e.ErrorMessage());
+            return;
+        }
+        if (!pCanvas) {
+            DEBUG_MESSAGE("    PcCreateObject returned NULL canvas");
+            return;
+        }
+        DEBUG_MESSAGE("    PcCreateObject ok: pCanvas=0x%08X",
+                      pCanvas.GetInterfacePtr());
+
+        // Step 8: canvas->Create(W, H) allocs the backing buffer; cx/cy=0
+        // anchors the canvas origin at (0,0) within its layer.
+        try {
+            pCanvas->Create(spec.canvasWidth, spec.canvasHeight);
+            pCanvas->cx = 0;
+            pCanvas->cy = 0;
+        } catch (const _com_error& e) {
+            DEBUG_MESSAGE("    canvas->Create / cx / cy threw HRESULT 0x%08X (%s)",
+                          static_cast<unsigned>(e.Error()), e.ErrorMessage());
+            return;
+        }
+        DEBUG_MESSAGE("    canvas Created %lux%lu cx=0 cy=0",
+                      spec.canvasWidth, spec.canvasHeight);
+
+        // Step 9: pNewLayer->InsertCanvas(pCanvas) — optional VARIANTs default
+        // to vtEmpty (no delay, no alpha override, no zoom override). The layer
+        // takes its own AddRef on the canvas, so our local pCanvas can release
+        // when the loop iteration ends.
+        try {
+            pNewLayer->InsertCanvas(pCanvas);
+        } catch (const _com_error& e) {
+            DEBUG_MESSAGE("    InsertCanvas threw HRESULT 0x%08X (%s)",
+                          static_cast<unsigned>(e.Error()), e.ErrorMessage());
+            return;
+        }
+
+        // Set the dirty flag last. KMST does this BEFORE step 1 for block 1
+        // and AFTER step 9 for blocks 2/3 — irrelevant in practice since the
+        // layer isn't drawn until the next frame, by which time everything
+        // has settled.
+        *reinterpret_cast<int32_t*>(pBytes + spec.dirtyOffset) = 1;
+        DEBUG_MESSAGE("    [%s] done: dirty@+0x%X=1", spec.tag,
+                      static_cast<unsigned>(spec.dirtyOffset));
+    }
+
+    DEBUG_MESSAGE("MonsterBook_CreateLayer: all 3 layers built ok");
 }
 
 // KMST 0x0084988E (32 lines) — tools/decomp/cache_kmst/0084988e.c.
@@ -170,6 +372,7 @@ static void MonsterBook_CreateLayer(void* /*pThis*/) {
 // KMST calls the user32!SetRect import via DAT_00be6724; we link directly
 // against ::SetRect since <windows.h> is already in this TU.
 static void MonsterBook_CreateRect(void* pThis) {
+    DEBUG_MESSAGE("MonsterBook_CreateRect: enter pThis=0x%08X", pThis);
     auto* pBytes = static_cast<uint8_t*>(pThis);
 
     auto* pTabRects = reinterpret_cast<RECT*>(pBytes + 0x15B8);
@@ -178,6 +381,11 @@ static void MonsterBook_CreateRect(void* pThis) {
         const int y = (i / 5) * 0x2D;
         ::SetRect(&pTabRects[i], x + 8, y + 0x1F, x + 0x23, y + 0x45);
     }
+    DEBUG_MESSAGE("  tab rects @+0x15B8: 25 zones, first=(%ld,%ld,%ld,%ld) last=(%ld,%ld,%ld,%ld)",
+                  pTabRects[0].left, pTabRects[0].top,
+                  pTabRects[0].right, pTabRects[0].bottom,
+                  pTabRects[24].left, pTabRects[24].top,
+                  pTabRects[24].right, pTabRects[24].bottom);
 
     auto* pCoverRects = reinterpret_cast<RECT*>(pBytes + 0x1748);
     for (int i = 0; i < 20; ++i) {
@@ -185,6 +393,11 @@ static void MonsterBook_CreateRect(void* pThis) {
         const int y = (i / 4) * 0x24;
         ::SetRect(&pCoverRects[i], x + 0x26, y + 0x3C, x + 0x46, y + 0x5C);
     }
+    DEBUG_MESSAGE("  cover rects @+0x1748: 20 zones, first=(%ld,%ld,%ld,%ld) last=(%ld,%ld,%ld,%ld)",
+                  pCoverRects[0].left, pCoverRects[0].top,
+                  pCoverRects[0].right, pCoverRects[0].bottom,
+                  pCoverRects[19].left, pCoverRects[19].top,
+                  pCoverRects[19].right, pCoverRects[19].bottom);
 }
 
 // KMST 0x0084991F (73 lines) — tools/decomp/cache_kmst/0084991f.c.
@@ -238,13 +451,22 @@ static void MonsterBook_CreateFontArray(void* /*pThis*/) {
 // Mirrors KMST CUIMonsterBook::CUIMonsterBook + OnCreate. Run on a fresh
 // kCUIMonsterBookSize buffer.
 static void MonsterBook_Construct(void* pThis) {
+    DEBUG_MESSAGE("MonsterBook_Construct: enter pThis=0x%08X size=0x%X",
+                  pThis, static_cast<unsigned>(kCUIMonsterBookSize));
+
     // CUIWnd::CUIWnd(this, 9, 0, 0, 0, 1, 0, 0) — args verbatim from KMST.
+    DEBUG_MESSAGE("  -> CUIWnd::CUIWnd(this, 9, 0, 0, 0, 1, 0, 0) at 0x%08X",
+                  static_cast<unsigned>(kCUIWnd_ctor));
     reinterpret_cast<void(__thiscall*)(void*, int, int, int, int, int, int, int)>(
         kCUIWnd_ctor)(pThis, 9, 0, 0, 0, 1, 0, 0);
+    DEBUG_MESSAGE("  <- CUIWnd::CUIWnd ok");
 
     // CreateUIWndPosSaved(this, 0x1DB, 0x15D, 10) — 475x349 client area.
+    DEBUG_MESSAGE("  -> CreateUIWndPosSaved(this, 0x1DB, 0x15D, 10) at 0x%08X",
+                  static_cast<unsigned>(kCUIWnd_CreateUIWndPosSaved));
     reinterpret_cast<void(__thiscall*)(void*, int, int, int)>(
         kCUIWnd_CreateUIWndPosSaved)(pThis, 0x1DB, 0x15D, 10);
+    DEBUG_MESSAGE("  <- CreateUIWndPosSaved ok");
 
     // KMST's OnCreate runs the five builders here, then calls
     // CMonsterBookMan::GetCard(cover) and either CCtrlTab::SetTab(9) +
@@ -256,6 +478,7 @@ static void MonsterBook_Construct(void* pThis) {
     MonsterBook_CreateRect(pThis);
     MonsterBook_CreateCardTable(pThis);
     MonsterBook_CreateFontArray(pThis);
+    DEBUG_MESSAGE("MonsterBook_Construct: builders done");
 }
 
 // Pre-destroy hook — runs in our UI_Close hook BEFORE we tail-call v95's
@@ -264,26 +487,46 @@ static void MonsterBook_Construct(void* pThis) {
 // +0x80, m_uiToolTip, m_abOption, m_sBackgrndUOL) and unregisters the
 // window from the wnd manager. It does NOT know about derived members,
 // so any ZRef / heap allocations the builders added need to be released
-// here. Currently that means the 5 nav buttons populated by CreateCtrl
-// at +0x1578..+0x1598 (m_pBtClose at +0x80 belongs to the base — leave
-// it for ~CUIWnd).
+// here:
+//   - 5 nav buttons populated by CreateCtrl at +0x1578..+0x1598
+//     (m_pBtClose at +0x80 belongs to the base — leave it for ~CUIWnd).
+//   - 3 IWzGr2DLayer raw COM ptrs populated by CreateLayer at
+//     +0x15A4 / +0x15AC / +0x15B4. Each holds one ref via our manual
+//     AddRef in CreateLayer; Release here drops it to zero and the
+//     COM dtor reclaims the layer + its inserted canvas.
 //
-// Setting each ZRef slot to nullptr triggers ZRef::operator=(nullptr_t)
-// which Releases the underlying button; if no other holder exists the
-// refcount drops to 0 and the C++ delete path frees it via ZAllocEx.
+// Setting each ZRef<CCtrlButton> slot to nullptr triggers ZRef::operator=
+// (nullptr_t) which Releases the underlying button. The IWzGr2DLayer slots
+// are raw COM ptrs (not ZRef) so we Release manually.
 //
 // Do NOT s_Free the buffer here — v95's scalar_deleting_dtor (reached
 // through the vtable Release call) does that, and an extra s_Free here
 // would double-free.
 static void MonsterBook_PreDestroy(void* pThis) {
+    DEBUG_MESSAGE("MonsterBook_PreDestroy: enter pThis=0x%08X", pThis);
+    auto* pBytes = static_cast<uint8_t*>(pThis);
+
+    static constexpr size_t kLayerSlotOffsets[] = { 0x15A4, 0x15AC, 0x15B4 };
+    for (auto offset : kLayerSlotOffsets) {
+        auto** pSlot = reinterpret_cast<IWzGr2DLayer**>(pBytes + offset);
+        if (*pSlot != nullptr) {
+            DEBUG_MESSAGE("  releasing IWzGr2DLayer @+0x%X ptr=0x%08X",
+                          static_cast<unsigned>(offset), *pSlot);
+            (*pSlot)->Release();
+            *pSlot = nullptr;
+        }
+    }
+
     static constexpr size_t kNavBtnSlotOffsets[] = {
         0x1578, 0x1580, 0x1588, 0x1590, 0x1598,
     };
     for (auto offset : kNavBtnSlotOffsets) {
-        auto* pSlot = reinterpret_cast<ZRef<CCtrlButton>*>(
-            static_cast<uint8_t*>(pThis) + offset);
+        auto* pSlot = reinterpret_cast<ZRef<CCtrlButton>*>(pBytes + offset);
+        DEBUG_MESSAGE("  releasing ZRef<CCtrlButton> @+0x%X",
+                      static_cast<unsigned>(offset));
         *pSlot = nullptr;
     }
+    DEBUG_MESSAGE("MonsterBook_PreDestroy: done");
 }
 
 
@@ -295,19 +538,25 @@ static auto CWvsContext__UI_Close = kCWvsContext_UI_Close;
 void __fastcall CWvsContext__UI_Open_hook(void* pCtx, void* /*EDX*/,
                                           int nUIType, int nOption) {
     if (nUIType == 9) {  // MONSTERBOOK — case 9 stripped from v95 UI_Open.
+        DEBUG_MESSAGE("UI_Open(9, %d): hook fired pCtx=0x%08X", nOption, pCtx);
+
         auto** pSlot = reinterpret_cast<void**>(
             static_cast<uint8_t*>(pCtx) + kCWvsContext_MonsterBookSlotPtr_Off);
         if (*pSlot != nullptr) {
             // Slot still set — window is already open. v95's other cases
             // gate the same way; matching the convention.
+            DEBUG_MESSAGE("  already open: pSlot=0x%08X *pSlot=0x%08X — bailing",
+                          pSlot, *pSlot);
             return;
         }
         void* pBuf = ZAllocEx<ZAllocAnonSelector>::s_Alloc(kCUIMonsterBookSize);
         if (!pBuf) {
-            DEBUG_MESSAGE("CUIMonsterBook s_Alloc(0x%X) failed",
+            DEBUG_MESSAGE("  s_Alloc(0x%X) failed",
                           static_cast<unsigned>(kCUIMonsterBookSize));
             return;
         }
+        DEBUG_MESSAGE("  s_Alloc(0x%X) -> 0x%08X",
+                      static_cast<unsigned>(kCUIMonsterBookSize), pBuf);
         std::memset(pBuf, 0, kCUIMonsterBookSize);
         MonsterBook_Construct(pBuf);
 
@@ -325,7 +574,8 @@ void __fastcall CWvsContext__UI_Open_hook(void* pCtx, void* /*EDX*/,
         *pSlot = pBuf;
         g_pV95MonsterBookGlobal = pBuf;
         g_pMonsterBookUI = pBuf;
-        DEBUG_MESSAGE("CUIMonsterBook open: 0x%08X", pBuf);
+        DEBUG_MESSAGE("UI_Open(9): wired up — pBuf=0x%08X slot@0x%08X DAT_00c6f010=0x%08X",
+                      pBuf, pSlot, pBuf);
         return;
     }
     reinterpret_cast<void(__thiscall*)(void*, int, int)>(CWvsContext__UI_Open)(
@@ -340,11 +590,11 @@ void __fastcall CWvsContext__UI_Close_hook(void* pCtx, void* /*EDX*/, int nUITyp
         auto** pSlot = reinterpret_cast<void**>(
             static_cast<uint8_t*>(pCtx) + kCWvsContext_MonsterBookSlotPtr_Off);
         void* pUI = *pSlot;
-        DEBUG_MESSAGE("CUIMonsterBook close: 0x%08X", pUI);
+        DEBUG_MESSAGE("UI_Close(9): hook fired pCtx=0x%08X *slot=0x%08X g_pUI=0x%08X",
+                      pCtx, pUI, g_pMonsterBookUI);
 
         // Release builder-allocated members BEFORE the v95 dtor path runs.
-        // ~CUIWnd doesn't know about the 5 nav buttons we added at
-        // +0x1578..+0x1598, so they'd leak per close cycle without this.
+        // ~CUIWnd doesn't know about derived members (nav buttons, layers).
         if (pUI != nullptr) {
             MonsterBook_PreDestroy(pUI);
         }
@@ -355,6 +605,7 @@ void __fastcall CWvsContext__UI_Close_hook(void* pCtx, void* /*EDX*/, int nUITyp
         // sentinel cleared too so the next /book sees a clean state.
         g_pV95MonsterBookGlobal = nullptr;
         g_pMonsterBookUI = nullptr;
+        DEBUG_MESSAGE("UI_Close(9): pre-destroy done; tail-calling v95 close");
     }
     // Tail-call: v95's case-9 close reads the slot we populated, runs
     // FUN_009b0e50 + FUN_009d1ae0, fires Release → virtual dtor → ~CUIWnd
