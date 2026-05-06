@@ -359,69 +359,6 @@ static void MonsterBook_CreateLayer(void* pThis) {
     }
 
     DEBUG_MESSAGE("MonsterBook_CreateLayer: all 3 layers built ok");
-
-    // ----- Empty parent-layer canvas for CWnd::Draw path B -----------------
-    //
-    // CWnd::Draw at 0x009AE5C0 path B (when *(this+0x78) != 0) calls
-    // FUN_0042B170 (= GetCanvas) which reads pParentLayer->canvas[0]. If
-    // the parent layer has no canvases, GetCanvas returns null and path B
-    // silently fails — which would explain why m_sBackgrndUOL + +0x78 are
-    // both populated but no bg renders. Last test confirmed +0x78 = a real
-    // pointer (0x790A1FF4) yet nothing visible; path B must be erroring.
-    //
-    // Fix: insert a fresh empty canvas sized to the wnd client area into
-    // the parent layer. Path B's GetCanvas will then return it as the draw
-    // destination; FUN_00401CF0(left, top, +0x78, &variant) draws the WZ
-    // bg canvas onto our empty canvas. The wnd-mgr then renders this
-    // canvas at the wnd's screen position alongside the children — buttons
-    // stay visible because they're separate child wnds, not occluded by
-    // the canvas living inside the layer.
-    //
-    // 475x349 = the wnd's client area set by CreateUIWndPosSaved. Lifetime:
-    // the InsertCanvas AddRef'd, parent layer holds the ref; ~CWnd Releases
-    // the parent layer which transitively releases this canvas. No PreDestroy
-    // cleanup needed.
-    DEBUG_MESSAGE("MonsterBook_CreateLayer: populate parent-layer canvas + Copy bg into it");
-    try {
-        // Resolve the bg WZ canvas so we can Copy() its pixels in.
-        IWzCanvasPtr pBgCanvas = get_unknown(get_rm()->GetObjectA(
-            Ztl_bstr_t(L"UI/UIWindow.img/MonsterBook/backgrnd")));
-        if (!pBgCanvas) {
-            DEBUG_MESSAGE("  bg WZ canvas resolved to NULL");
-        } else {
-            DEBUG_MESSAGE("  bg WZ canvas: 0x%08X w=%lu h=%lu",
-                          pBgCanvas.GetInterfacePtr(),
-                          static_cast<unsigned long>(pBgCanvas->width),
-                          static_cast<unsigned long>(pBgCanvas->height));
-
-            IWzCanvasPtr pParentCanvas;
-            PcCreateObject<IWzCanvasPtr>(L"Canvas", pParentCanvas, nullptr);
-            if (!pParentCanvas) {
-                DEBUG_MESSAGE("  PcCreateObject returned NULL parent canvas");
-            } else {
-                pParentCanvas->Create(0x1DB, 0x15D);
-                pParentCanvas->cx = 0;
-                pParentCanvas->cy = 0;
-                DEBUG_MESSAGE("  parent canvas Created 475x349, cx/cy=0: 0x%08X",
-                              pParentCanvas.GetInterfacePtr());
-
-                // Copy bg pixels into the empty canvas. If parent-layer
-                // canvases render at all, this will show the full bg
-                // image. The previous v3 test (direct InsertCanvas of WZ
-                // canvas without Create+Copy) didn't render — so this is
-                // a focused test of whether the Create+Copy combination
-                // is the missing piece for parent-layer canvas rendering.
-                pParentCanvas->Copy(0, 0, pBgCanvas);
-                DEBUG_MESSAGE("  parent canvas Copy(0,0,bg) ok");
-
-                pParentLayer->InsertCanvas(pParentCanvas);
-                DEBUG_MESSAGE("  parent canvas InsertCanvas ok");
-            }
-        }
-    } catch (const _com_error& e) {
-        DEBUG_MESSAGE("  parent-canvas build threw HRESULT 0x%08X (%s)",
-                      static_cast<unsigned>(e.Error()), e.ErrorMessage());
-    }
 }
 
 // KMST 0x0084988E (32 lines) — tools/decomp/cache_kmst/0084988e.c.
@@ -530,36 +467,6 @@ static void MonsterBook_Construct(void* pThis) {
     reinterpret_cast<void(__thiscall*)(void*, int, int, int)>(
         kCUIWnd_CreateUIWndPosSaved)(pThis, 0x1DB, 0x15D, 10);
     DEBUG_MESSAGE("  <- CreateUIWndPosSaved ok");
-
-    // ----- Wnd-level bg setup --------------------------------------------
-    //
-    // Wire the bg through CUIWnd's standard mechanism rather than as an
-    // overlay layer. Why: overlay layers render AFTER child wnds (=
-    // CCtrlButtons), so any overlay covering button positions hides them.
-    // Last test confirmed this — a full-window bg overlay made every
-    // button disappear regardless of its z. CWnd::Draw at v95 0x009AE5C0
-    // checks *(this+0x78) — if non-zero it draws the wnd bg via
-    // FUN_00401cf0(left, top, *(+0x78), &local_1c). That happens BEFORE
-    // children draw, so buttons render on top.
-    //
-    // The 3-arg CUIWnd::OnCreate at 0x008DDB30 is the entry point. With
-    // a non-empty sUOL it calls FUN_00417D40 (assigns m_sBackgrndUOL)
-    // followed by FUN_008DDAE0 → FUN_009AFEB0 which loads the canvas via
-    // ResMan and populates the wnd's bg-canvas slot at +0x78. Gated by
-    // *(this+0xAFA) which CUIWnd::CUIWnd already set to 1 via param_6.
-    //
-    // After this returns, log *(this+0x78) so we can see whether
-    // FUN_009AFEB0 actually populated the slot. Non-zero = bg wired up.
-    DEBUG_MESSAGE("  -> CUIWnd::OnCreate(NULL, L\"backgrnd\", 0) at 0x%08X",
-                  0x008DDB30u);
-    {
-        ZXString<wchar_t> sBgUOL(L"UI/UIWindow.img/MonsterBook/backgrnd");
-        reinterpret_cast<void(__thiscall*)(void*, void*, ZXString<wchar_t>, int32_t)>(
-            0x008DDB30)(pThis, /*pData=*/nullptr, sBgUOL, /*bMultiBg=*/0);
-    }
-    DEBUG_MESSAGE("  <- CUIWnd::OnCreate done; *(+0x78)=0x%08X *(+0xB04)=0x%08X",
-                  *reinterpret_cast<void**>(static_cast<uint8_t*>(pThis) + 0x78),
-                  *reinterpret_cast<void**>(static_cast<uint8_t*>(pThis) + 0xB04));
 
     // KMST's OnCreate runs the five builders here, then calls
     // CMonsterBookMan::GetCard(cover) and either CCtrlTab::SetTab(9) +
