@@ -4,7 +4,6 @@
 #include "ztl/ztl.h"
 #include "wvs/uimonsterbook.h"
 #include "wvs/ctrlwnd.h"
-#include "wvs/layoutman.h"
 #include "wvs/wnd.h"
 
 #include <cstring>
@@ -70,16 +69,6 @@ namespace {
     // UI_Open's "already open" gate reads the slot directly so this is
     // just a friendly handle for the close-side log line.
     void* g_pMonsterBookUI = nullptr;
-
-    // Layer manager for the MonsterBook UI's background + sprite layers.
-    // Allocated on UI open, populated by MonsterBook_CreateLayer with
-    // AddLayer calls (one per WZ canvas), freed on UI close. Outlives
-    // MonsterBook_Construct because the layers it owns must persist for
-    // the wnd's lifetime — a stack-local CLayoutMan would Release the
-    // layers as soon as Construct returned. There is at most one
-    // MonsterBook UI open at a time (the v95 ZRef slot at +0x3EB4
-    // gates re-opens), so a single global ptr suffices.
-    CLayoutMan* g_pMonsterBookLayoutMan = nullptr;
 }
 
 
@@ -155,78 +144,19 @@ static void MonsterBook_CreateCtrl(void* pThis) {
 }
 
 // KMST 0x00848C8A (601 lines) — tools/decomp/cache_kmst/00848c8a.c.
-// KMST builds 3 LAYERs via raw IWzGr2D::CreateLayer + InsertCanvas dances —
-// 601 lines of COM error-checking and variant juggling. v95 ships a much
-// simpler helper: CLayoutMan::AddLayer at 0x005CDB70 (sUOL, z, bManaged)
-// wraps the entire pattern as a single call, used by surviving v95 UIs
-// like CUIUnreleaseDlg::OnCreate (verified caller via decomp.py callers).
+// Builds the 3 LAYER child controls at v95 +0x15A0..+0x15B8 (8 bytes each).
+// Each LAYER is dirty-flag-driven by UpdateUI which writes 1 to the first
+// field on every refresh.
 //
-// The kinoko port substitutes that helper. Each AddLayer reads a WZ canvas
-// at the given UOL, builds an IWzGr2DLayer from it, and attaches it as a
-// child of the parent CWnd's layer at the supplied z. CLayoutMan stores
-// IWzGr2DLayerPtr in m_aLayer; ~CLayoutMan releases all of them in one
-// shot when we delete the CLayoutMan in MonsterBook_PreDestroy.
-//
-// SCOPE: this only loads the static MonsterBook artwork (window frame +
-// sprite sheets verified in UI.wz/UIWindow.img/MonsterBook). It does NOT
-// reproduce KMST's full 3-LAYER architecture — those LAYERs back per-tab
-// dynamic compositing (card-grid sprites blitted on dirty refresh, mob
-// viewer animation, cover-tab cycling). UpdateUI's writes of 1 to the
-// dirty flags at +0x15A0/+0x15A8/+0x15B0 still hit empty slots and are
-// harmless. Per-tab card sprites won't render until the deferred
-// CreateCardTable + a follow-up "draw cards into a managed layer" slice
-// land.
-static void MonsterBook_CreateLayer(void* pThis) {
-    // Diagnostic: dump the wnd's layer state. CWnd::GetLayer reads
-    // *(this+0x18); if that's null, AddLayer's parent-layer lookup
-    // can't attach the new child. m_pLayer should be set by
-    // CWnd::PreCreateWnd (called via vtable[2] from FUN_009AD8F0
-    // inside CreateUIWndPosSaved).
-    void* pWndLayer = *reinterpret_cast<void**>(
-        static_cast<uint8_t*>(pThis) + 0x18);
-    DEBUG_MESSAGE("MonsterBook_CreateLayer: pThis=0x%08X m_pLayer@+0x18=0x%08X",
-                  pThis, pWndLayer);
-
-    if (g_pMonsterBookLayoutMan != nullptr) {
-        // Defensive: should have been cleaned in PreDestroy.
-        delete g_pMonsterBookLayoutMan;
-        g_pMonsterBookLayoutMan = nullptr;
-    }
-    g_pMonsterBookLayoutMan = new CLayoutMan();
-    if (!g_pMonsterBookLayoutMan) {
-        DEBUG_MESSAGE("CUIMonsterBook CLayoutMan alloc failed");
-        return;
-    }
-    g_pMonsterBookLayoutMan->Init(reinterpret_cast<CWnd*>(pThis), 0, 0);
-
-    // Sanity-check: did Init actually set m_pWnd to our wnd? If not,
-    // the GetLayer call inside AddSingleLayer dereferences a null
-    // m_pWnd and returns null without obvious failure.
-    DEBUG_MESSAGE("  LayoutMan@0x%08X m_pWnd=0x%08X expected=0x%08X",
-                  g_pMonsterBookLayoutMan,
-                  g_pMonsterBookLayoutMan->m_pWnd, pThis);
-
-    // === Diagnostic: AddSingleLayer on a known-Property UOL ================
-    // BtClose is the path our visible close-X button uses, so we know the
-    // archive + path resolve correctly. If AddSingleLayer succeeds on
-    // this Property but fails on the backgrnd Canvas, the loader expects
-    // a Property root with sub-canvases (animation frames or button
-    // states) and a single-Canvas leaf can't be wrapped as a layer
-    // through this path. Different workaround needed.
-    IWzGr2DLayerPtr btCloseLayer;
-    reinterpret_cast<IWzGr2DLayerPtr*(__thiscall*)(CLayoutMan*, IWzGr2DLayerPtr*, const wchar_t*, int32_t, int32_t)>(
-        0x005CDCB0)(g_pMonsterBookLayoutMan, std::addressof(btCloseLayer),
-                    L"UI/UIWindow.img/MonsterBook/BtClose", 0, 0);
-    DEBUG_MESSAGE("  AddSingleLayer(\"BtClose\" Property) raw=0x%08X",
-                  *reinterpret_cast<void**>(&btCloseLayer));
-
-    // Original AddSingleLayer for the bg.
-    IWzGr2DLayerPtr layer;
-    reinterpret_cast<IWzGr2DLayerPtr*(__thiscall*)(CLayoutMan*, IWzGr2DLayerPtr*, const wchar_t*, int32_t, int32_t)>(
-        0x005CDCB0)(g_pMonsterBookLayoutMan, std::addressof(layer),
-                    L"UI/UIWindow.img/MonsterBook/backgrnd", 0, 0);
-    DEBUG_MESSAGE("  AddSingleLayer(\"backgrnd\" Canvas) raw=0x%08X",
-                  *reinterpret_cast<void**>(&layer));
+// DEFERRED Phase 2-port-2: heavy COM body (IWzGr2D::CreateLayer / IWzGr2DLayer
+// / _variant_t / ZComAPI::ZComVariantClear / vtable-indexed calls into
+// IWzGr2DLayer at vtbl+0x64). Each COM helper's v95 address must be
+// verified before this can run — _g_gr, vtMissing, the IWzGr2D / IWzGr2DLayer
+// vtables, ZComAPI thunks. Until landed, the 3 LAYER slots stay zero,
+// UpdateUI's writes of `1` to +0x15A0/+0x15A8/+0x15B0 are harmless (just dirty
+// flags), and no draw output appears for the per-tab card grid / mob viewer.
+static void MonsterBook_CreateLayer(void* /*pThis*/) {
+    // TODO Phase 2-port-2.
 }
 
 // KMST 0x0084988E (32 lines) — tools/decomp/cache_kmst/0084988e.c.
@@ -308,21 +238,13 @@ static void MonsterBook_CreateFontArray(void* /*pThis*/) {
 // Mirrors KMST CUIMonsterBook::CUIMonsterBook + OnCreate. Run on a fresh
 // kCUIMonsterBookSize buffer.
 static void MonsterBook_Construct(void* pThis) {
-    DEBUG_MESSAGE("MonsterBook_Construct entry: pThis=0x%08X", pThis);
-
     // CUIWnd::CUIWnd(this, 9, 0, 0, 0, 1, 0, 0) — args verbatim from KMST.
     reinterpret_cast<void(__thiscall*)(void*, int, int, int, int, int, int, int)>(
         kCUIWnd_ctor)(pThis, 9, 0, 0, 0, 1, 0, 0);
 
-    DEBUG_MESSAGE("  after CUIWnd::CUIWnd: m_pLayer@+0x18=0x%08X",
-                  *reinterpret_cast<void**>(static_cast<uint8_t*>(pThis) + 0x18));
-
     // CreateUIWndPosSaved(this, 0x1DB, 0x15D, 10) — 475x349 client area.
     reinterpret_cast<void(__thiscall*)(void*, int, int, int)>(
         kCUIWnd_CreateUIWndPosSaved)(pThis, 0x1DB, 0x15D, 10);
-
-    DEBUG_MESSAGE("  after CreateUIWndPosSaved: m_pLayer@+0x18=0x%08X",
-                  *reinterpret_cast<void**>(static_cast<uint8_t*>(pThis) + 0x18));
 
     // KMST's OnCreate runs the five builders here, then calls
     // CMonsterBookMan::GetCard(cover) and either CCtrlTab::SetTab(9) +
@@ -361,14 +283,6 @@ static void MonsterBook_PreDestroy(void* pThis) {
         auto* pSlot = reinterpret_cast<ZRef<CCtrlButton>*>(
             static_cast<uint8_t*>(pThis) + offset);
         *pSlot = nullptr;
-    }
-
-    // Release every layer we attached in CreateLayer. ~CLayoutMan walks
-    // m_aLayer and Releases each IWzGr2DLayerPtr; once the parent CWnd's
-    // layer drops its child ref too the layers free entirely.
-    if (g_pMonsterBookLayoutMan != nullptr) {
-        delete g_pMonsterBookLayoutMan;
-        g_pMonsterBookLayoutMan = nullptr;
     }
 }
 
