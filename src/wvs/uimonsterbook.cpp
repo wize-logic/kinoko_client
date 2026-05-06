@@ -30,16 +30,17 @@ constexpr size_t kCUIMonsterBookSize = 0x18E0;
 //                 — case 9 IS implemented (gates on this+0x3EB4) but the
 //                   slot it gates on is never set in stock v95, so the
 //                   handler always no-ops in practice.
-//   FUN_0076ad50  CWvsContext::RemoveFromStackForTab(CUIWnd*)
-//                 — list-remove from this+0x3DA4. No vtable callbacks,
-//                   safe to invoke from inside a click handler.
+//   FUN_008dd380  CUIWnd::OnDestroy — proper CUIWnd teardown. Removes
+//                 the window from whatever wnd-manager list it lives in
+//                 + releases CUIWnd-base members. Safe to call from a
+//                 click handler — does not free the buffer itself.
 //   DAT_00c6f010  global CUIMonsterBook* singleton — OnMonsterBookSetCard
 //                 / OnMonsterBookSetCover gate on this for null-bail.
 constexpr uintptr_t kCUIWnd_ctor                          = 0x008DD680;
 constexpr uintptr_t kCUIWnd_CreateUIWndPosSaved           = 0x008DD300;
+constexpr uintptr_t kCUIWnd_OnDestroy                     = 0x008DD380;
 constexpr uintptr_t kCWvsContext_UI_Open                  = 0x009D83F0;
 constexpr uintptr_t kCWvsContext_UI_Close                 = 0x009D5370;
-constexpr uintptr_t kCWvsContext_RemoveFromStackForTab    = 0x0076AD50;
 constexpr uintptr_t kDAT_MonsterBookGlobal                = 0x00C6F010;
 
 
@@ -264,14 +265,15 @@ void __fastcall CWvsContext__UI_Close_hook(void* pCtx, void* /*EDX*/, int nUITyp
         // teardown directly and skip the tail-call.
         if (g_pMonsterBookUI) {
             DEBUG_MESSAGE("CUIMonsterBook close: 0x%08X", g_pMonsterBookUI);
-            // Take the window OUT of CWvsContext's draw stack so the wnd
-            // manager stops iterating it. Pure list-remove, no callbacks
-            // into the window's vtable — safe to call from the click
-            // handler that's still on the stack above us.
-            reinterpret_cast<void(__thiscall*)(void*, void*)>(
-                kCWvsContext_RemoveFromStackForTab)(pCtx, g_pMonsterBookUI);
+            // Tear down the CUIWnd-base state: removes the window from the
+            // wnd manager's draw list and releases m_pBtClose / m_uiToolTip
+            // / m_sBackgrndUOL / m_abOption. Does not free the buffer
+            // itself, so it's safe even though the close X button's click
+            // handler is still on the stack above us.
+            reinterpret_cast<void(__thiscall*)(void*)>(kCUIWnd_OnDestroy)(
+                g_pMonsterBookUI);
             // Defer the actual buffer free until the next UI_Open. Freeing
-            // here returns into the now-freed close button.
+            // here would return into the now-released close button.
             g_pMonsterBookPendingFree = g_pMonsterBookUI;
             g_pMonsterBookUI = nullptr;
             g_pV95MonsterBookGlobal = nullptr;
