@@ -71,19 +71,6 @@ namespace {
     // UI_Open's "already open" gate reads the slot directly so this is
     // just a friendly handle for the close-side log line.
     void* g_pMonsterBookUI = nullptr;
-
-    // Bg-layer ownership. KMST builds 3 child layers but no full-window
-    // bg layer — the bg image normally lives in CWnd's draw chain via
-    // m_sBackgrndUOL+m_pCanvas mechanics (which our wnd doesn't have
-    // populated since we never went through the standard Open path).
-    // Instead we attach a 4th overlay layer parented to CWnd::GetLayer,
-    // sized to the full 475x349 wnd, with the bg WZ canvas copied in.
-    //
-    // MonsterBook is a singleton (DAT_00c6f010 gates open/close) so a
-    // file-scope smart-ptr is safe — single open instance at a time. The
-    // smart-ptr's Release fires on Construct's overwrite (next open) or
-    // explicitly in PreDestroy.
-    IWzGr2DLayerPtr g_pBgLayer;
 }
 
 
@@ -372,92 +359,6 @@ static void MonsterBook_CreateLayer(void* pThis) {
     }
 
     DEBUG_MESSAGE("MonsterBook_CreateLayer: all 3 layers built ok");
-
-    // ----- Background layer (4th overlay) ---------------------------------
-    //
-    // The previous test confirmed parent-layer-direct-InsertCanvas does NOT
-    // render even though the canvas resolved fine, parent visible=1, and
-    // InsertCanvas didn't throw. Copying into a sub-layer's canvas DID
-    // render (visible as a 174x256 chunk at L0's (40,25) origin). So the
-    // parent layer is an overlay container that doesn't paint its own
-    // canvases — we need a sub-layer.
-    //
-    // Add a 4th overlay layer at (0, 0) covering the full 475x349 wnd
-    // client area, parented to pParentLayer with z=parent+0 (under the
-    // 3 foreground sub-layers at z=parent+1/+2). Copy the WZ-resolved bg
-    // pixels into the layer's canvas. Same pattern as the 3 KMST sub-
-    // layers, just full-window-sized + with real pixel data via Copy.
-    //
-    // Lifetime: store in g_pBgLayer (file-scope smart-ptr, single
-    // MonsterBook instance via DAT_00c6f010 gating). PreDestroy clears
-    // it; next Construct overwrites (which Releases the previous via
-    // operator=).
-    DEBUG_MESSAGE("MonsterBook_CreateLayer: building bg overlay layer");
-    try {
-        IWzCanvasPtr pBgCanvas = get_unknown(get_rm()->GetObjectA(
-            Ztl_bstr_t(L"UI/UIWindow.img/MonsterBook/backgrnd")));
-        if (!pBgCanvas) {
-            DEBUG_MESSAGE("  bg WZ canvas resolved to NULL — aborting bg-layer build");
-        } else {
-            DEBUG_MESSAGE("  bg WZ canvas: 0x%08X w=%lu h=%lu cx=%ld cy=%ld",
-                          pBgCanvas.GetInterfacePtr(),
-                          static_cast<unsigned long>(pBgCanvas->width),
-                          static_cast<unsigned long>(pBgCanvas->height),
-                          static_cast<long>(pBgCanvas->cx),
-                          static_cast<long>(pBgCanvas->cy));
-
-            const unsigned long bgWidth  = pBgCanvas->width;
-            const unsigned long bgHeight = pBgCanvas->height;
-
-            IWzGr2DLayerPtr pBgLayer = pGr->CreateLayer(
-                /*nLeft=*/0, /*nTop=*/0,
-                /*uWidth=*/0, /*uHeight=*/0,
-                /*nZ=*/0, vtEmpty, vFilter);
-            if (!pBgLayer) {
-                DEBUG_MESSAGE("  bg-layer CreateLayer returned NULL");
-            } else {
-                DEBUG_MESSAGE("  bg-layer CreateLayer ok: 0x%08X",
-                              pBgLayer.GetInterfacePtr());
-
-                pBgLayer->origin = vParent;
-                pBgLayer->overlay = vParent;
-                pBgLayer->color = 0xFFFFFFFFUL;
-                // z = parentZ - 1 puts the bg STRICTLY below everything at
-                // parent z (= 10), including the CCtrlButtons. Last test
-                // showed buttons disappeared when bg was at parentZ — same
-                // z + bg inserted later in the chain = bg drew over them.
-                // Sub-layers at z=11/12 are above; foreground stays correct.
-                pBgLayer->z = parentZ - 1;
-                DEBUG_MESSAGE("  bg-layer configured: origin/overlay=parent z=%ld",
-                              parentZ - 1);
-
-                IWzCanvasPtr pBgLayerCanvas;
-                PcCreateObject<IWzCanvasPtr>(L"Canvas", pBgLayerCanvas, nullptr);
-                pBgLayerCanvas->Create(bgWidth, bgHeight);
-                pBgLayerCanvas->cx = 0;
-                pBgLayerCanvas->cy = 0;
-                DEBUG_MESSAGE("  bg-layer canvas: 0x%08X created %lux%lu",
-                              pBgLayerCanvas.GetInterfacePtr(),
-                              bgWidth, bgHeight);
-
-                pBgLayerCanvas->Copy(0, 0, pBgCanvas);
-                DEBUG_MESSAGE("  bg-layer canvas Copy(0,0,bg) ok");
-
-                pBgLayer->InsertCanvas(pBgLayerCanvas);
-                DEBUG_MESSAGE("  bg-layer InsertCanvas ok");
-
-                // Store ref-owning smart-ptr at file scope so the layer
-                // outlives this function. operator= here Releases any
-                // previous bg layer (e.g. from a prior open we didn't
-                // PreDestroy cleanly).
-                g_pBgLayer = pBgLayer;
-                DEBUG_MESSAGE("  bg-layer stored in g_pBgLayer");
-            }
-        }
-    } catch (const _com_error& e) {
-        DEBUG_MESSAGE("  bg-layer build threw HRESULT 0x%08X (%s)",
-                      static_cast<unsigned>(e.Error()), e.ErrorMessage());
-    }
 }
 
 // KMST 0x0084988E (32 lines) — tools/decomp/cache_kmst/0084988e.c.
@@ -567,6 +468,36 @@ static void MonsterBook_Construct(void* pThis) {
         kCUIWnd_CreateUIWndPosSaved)(pThis, 0x1DB, 0x15D, 10);
     DEBUG_MESSAGE("  <- CreateUIWndPosSaved ok");
 
+    // ----- Wnd-level bg setup --------------------------------------------
+    //
+    // Wire the bg through CUIWnd's standard mechanism rather than as an
+    // overlay layer. Why: overlay layers render AFTER child wnds (=
+    // CCtrlButtons), so any overlay covering button positions hides them.
+    // Last test confirmed this — a full-window bg overlay made every
+    // button disappear regardless of its z. CWnd::Draw at v95 0x009AE5C0
+    // checks *(this+0x78) — if non-zero it draws the wnd bg via
+    // FUN_00401cf0(left, top, *(+0x78), &local_1c). That happens BEFORE
+    // children draw, so buttons render on top.
+    //
+    // The 3-arg CUIWnd::OnCreate at 0x008DDB30 is the entry point. With
+    // a non-empty sUOL it calls FUN_00417D40 (assigns m_sBackgrndUOL)
+    // followed by FUN_008DDAE0 → FUN_009AFEB0 which loads the canvas via
+    // ResMan and populates the wnd's bg-canvas slot at +0x78. Gated by
+    // *(this+0xAFA) which CUIWnd::CUIWnd already set to 1 via param_6.
+    //
+    // After this returns, log *(this+0x78) so we can see whether
+    // FUN_009AFEB0 actually populated the slot. Non-zero = bg wired up.
+    DEBUG_MESSAGE("  -> CUIWnd::OnCreate(NULL, L\"backgrnd\", 0) at 0x%08X",
+                  0x008DDB30u);
+    {
+        ZXString<wchar_t> sBgUOL(L"UI/UIWindow.img/MonsterBook/backgrnd");
+        reinterpret_cast<void(__thiscall*)(void*, void*, ZXString<wchar_t>, int32_t)>(
+            0x008DDB30)(pThis, /*pData=*/nullptr, sBgUOL, /*bMultiBg=*/0);
+    }
+    DEBUG_MESSAGE("  <- CUIWnd::OnCreate done; *(+0x78)=0x%08X *(+0xB04)=0x%08X",
+                  *reinterpret_cast<void**>(static_cast<uint8_t*>(pThis) + 0x78),
+                  *reinterpret_cast<void**>(static_cast<uint8_t*>(pThis) + 0xB04));
+
     // KMST's OnCreate runs the five builders here, then calls
     // CMonsterBookMan::GetCard(cover) and either CCtrlTab::SetTab(9) +
     // SetRightTab(0) (no cover) or SelectCard(cover). All five builders are
@@ -604,15 +535,6 @@ static void MonsterBook_Construct(void* pThis) {
 static void MonsterBook_PreDestroy(void* pThis) {
     DEBUG_MESSAGE("MonsterBook_PreDestroy: enter pThis=0x%08X", pThis);
     auto* pBytes = static_cast<uint8_t*>(pThis);
-
-    // Release the file-scope bg-layer first — it's parented to the wnd's
-    // parent layer via overlay, so dropping our ref now Disconnects it
-    // before the wnd dtor tears down the parent.
-    if (g_pBgLayer) {
-        DEBUG_MESSAGE("  releasing g_pBgLayer ptr=0x%08X",
-                      g_pBgLayer.GetInterfacePtr());
-        g_pBgLayer = nullptr;
-    }
 
     static constexpr size_t kLayerSlotOffsets[] = { 0x15A4, 0x15AC, 0x15B4 };
     for (auto offset : kLayerSlotOffsets) {
