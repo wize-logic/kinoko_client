@@ -65,14 +65,14 @@ constexpr uintptr_t kDAT_MonsterBookGlobal                = 0x00C6F010;
 // itself, so vtable-dispatched calls into 0x009AE7C0 are also caught.)
 constexpr uintptr_t kCWnd_Update                          = 0x009AE7C0;
 
-// CWnd::OnButtonClicked — base no-op (`ret 4`) at 0x00429280. CCtrlButton::
-// MouseUp dispatches button clicks via the parent's vtable: slot 7
-// (OnChildNotify @ 0x00429260, dispatches msg=100 to slot 8) → slot 8
-// (OnButtonClicked). v95 stripped CUIMonsterBook's override, so our buffer's
-// vtable slot 8 inherits the CWnd no-op. We hook the no-op address with
-// Detours and filter on `pThis == g_pV95MonsterBookGlobal` so only our
-// window's button clicks route to MonsterBook_OnButtonClicked.
-constexpr uintptr_t kCWnd_OnButtonClicked                 = 0x00429280;
+// CUIWnd::OnButtonClicked at 0x008DD520. Earlier guess was the CWnd base
+// no-op at 0x00429280, but v95 CUIWnd OVERRIDES — its vtable slot 8 routes
+// id=1000 to CWvsContext::UI_Close (so the close X works) and no-ops every
+// other id. v95 CUIWnd::CUIWnd stamps THIS vtable into our buffer, so all
+// our nav-button clicks land here. Filter on `pThis == g_pV95MonsterBookGlobal`
+// inside the hook; the original tail-call still runs after our handler so
+// id=1000 closing keeps working unchanged.
+constexpr uintptr_t kCUIWnd_OnButtonClicked               = 0x008DD520;
 
 
 // === Mod-side state =========================================================
@@ -830,23 +830,23 @@ static void MonsterBook_PreDestroy(void* pThis) {
 // CMonsterBookAccessor::SetCount @ 0x009118F0). To paint the real mob portrait
 // we have to resolve cardId → mobId and load the canvas ourselves.
 //
-// Resolution path: `Item.wz/Consume/0238.img/<cardId>/info/mob` is an int
-// property (mobId). v95 exposes CItemInfo::GetItemInfo(itemId) at 0x005A8F20
-// which returns the corresponding IWzPropertyPtr; we read the `info/mob` int
-// from there. Once we have mobId we load `Mob/%07d.img/stand/0` via ResMan.
+// Resolution path: v95 monster book card definitions live in
+// `Etc/MonsterBook.img/<cardId>/mob` (verified empirically — the prior
+// Item.wz/Consume/0238 lookup returned mobId=0 for every cardId since v95
+// shifted card IDs to the 240xxxx series and CItemInfo doesn't index the
+// MonsterBook subtree). v95 LoadCard @ 0x006634b0 walks Etc.wz/MonsterBook.img
+// to populate CMonsterBookMan, so the WZ tree is guaranteed present.
 //
-// Both maps are populated on demand and cleared by MonsterBook_PreDestroy.
-// Caching is essential: a /book session repaints LAYER[0] every dirty cycle
-// (~once per Update tick), so re-probing 25 WZ paths per frame would tank
-// the frame rate and re-walk the WZ archive needlessly.
+// Once we have mobId we load `Mob/%07d.img/stand/0` via ResMan. Both maps are
+// populated on demand and cleared by MonsterBook_PreDestroy. Caching is
+// essential: a /book session repaints LAYER[0] every dirty cycle, so re-
+// probing 25 WZ paths per frame would tank the frame rate and re-walk the
+// WZ archive needlessly.
 
 namespace {
     std::unordered_map<int32_t, int32_t> g_cardToMob;
     std::unordered_map<int32_t, IWzCanvasPtr> g_mobIcon;
 
-    // Resolve cardId (5xxxxxx) → mobId by reading the WZ property tree once
-    // per cardId. Misses (e.g. non-card items, cards lacking `info/mob`) are
-    // cached as 0 so we don't keep probing for a missing key every frame.
     int32_t MonsterBook_ResolveMobId(int32_t cardId) {
         auto it = g_cardToMob.find(cardId);
         if (it != g_cardToMob.end()) {
@@ -854,16 +854,12 @@ namespace {
         }
         int32_t mobId = 0;
         try {
-            if (auto* pInfo = CItemInfo::GetInstance()) {
-                IWzPropertyPtr pProp = pInfo->GetItemInfo(cardId);
-                if (pProp) {
-                    IWzPropertyPtr pInfoNode = pProp->item[L"info"].GetUnknown();
-                    if (pInfoNode) {
-                        mobId = static_cast<int32_t>(get_int32(
-                            pInfoNode->item[L"mob"], 0));
-                    }
-                }
-            }
+            wchar_t sPath[64];
+            swprintf_s(sPath, 64, L"Etc/MonsterBook.img/%d/mob", cardId);
+            // ResMan returns the property's variant — for an int leaf the
+            // variant holds VT_I4. get_int32 unwraps + handles missing keys.
+            mobId = static_cast<int32_t>(get_int32(
+                get_rm()->GetObjectA(Ztl_bstr_t(sPath)), 0));
         } catch (const _com_error& e) {
             DEBUG_MESSAGE("  ResolveMobId(%d) threw 0x%08X (%s)",
                           cardId, static_cast<unsigned>(e.Error()),
@@ -1599,16 +1595,17 @@ static void MonsterBook_OnButtonClicked(uint8_t* pBytes, uint32_t nId) {
 static auto CWvsContext__UI_Open = kCWvsContext_UI_Open;
 static auto CWvsContext__UI_Close = kCWvsContext_UI_Close;
 static auto CWnd__Update = kCWnd_Update;
-static auto CWnd__OnButtonClicked = kCWnd_OnButtonClicked;
+static auto CUIWnd__OnButtonClicked = kCUIWnd_OnButtonClicked;
 
-void __fastcall CWnd__OnButtonClicked_hook(void* pThis, void* /*EDX*/, uint32_t nId) {
-    // Detoured globally over CWnd::OnButtonClicked. Filter on our wnd; let
-    // every other CWnd subclass that inherits the no-op pass through. The
-    // base impl returns immediately so the post-call tail is just the ret.
+void __fastcall CUIWnd__OnButtonClicked_hook(void* pThis, void* /*EDX*/, uint32_t nId) {
+    // Detoured over CUIWnd::OnButtonClicked. Filter on our wnd; let every
+    // other CUIWnd subclass pass through unchanged. Original handles id=1000
+    // close (tail-calls CWvsContext::UI_Close) and no-ops every other id, so
+    // running our handler first then chaining is safe for both branches.
     if (pThis != nullptr && pThis == g_pV95MonsterBookGlobal) {
         MonsterBook_OnButtonClicked(static_cast<uint8_t*>(pThis), nId);
     }
-    reinterpret_cast<void(__thiscall*)(void*, uint32_t)>(CWnd__OnButtonClicked)(
+    reinterpret_cast<void(__thiscall*)(void*, uint32_t)>(CUIWnd__OnButtonClicked)(
         pThis, nId);
 }
 
@@ -1711,9 +1708,8 @@ void AttachUIMonsterBook() {
     ATTACH_HOOK(CWvsContext__UI_Close, CWvsContext__UI_Close_hook);
     // Hooks every CWnd::Update — filtered to our wnd inside the detour.
     ATTACH_HOOK(CWnd__Update, CWnd__Update_hook);
-    // Hooks every CWnd::OnButtonClicked (the base no-op CWnd subclasses
-    // inherit when they don't override) — filtered to our wnd inside the
-    // detour. Other inheritors of the base see no behavior change since the
-    // hook tail-calls the original ret-4.
-    ATTACH_HOOK(CWnd__OnButtonClicked, CWnd__OnButtonClicked_hook);
+    // Hooks CUIWnd::OnButtonClicked — filtered to our wnd inside the detour.
+    // Other CUIWnd subclasses pass through to the original (which handles
+    // id=1000 close and no-ops every other id, so chaining is safe).
+    ATTACH_HOOK(CUIWnd__OnButtonClicked, CUIWnd__OnButtonClicked_hook);
 }
