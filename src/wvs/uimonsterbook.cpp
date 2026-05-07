@@ -876,20 +876,15 @@ namespace {
                           static_cast<unsigned>(e.Error()), e.ErrorMessage());
         }
 
+        // Now that we know cards are 2380000+ (low 16 = 0x50E0+), probe the
+        // expected leaf format under Item/Consume/0238.img.
         const wchar_t* kProbes[] = {
-            // Confirmed v95 LoadCard path.
             L"Item/Consume/0238.img",
-            // Try cardId leaf in multiple formats — first cardId from log
-            // is 2400704; if WZ keys are 0238-prefix (= 2380xxx range only),
-            // 2400704 might not appear at all and probing helps identify.
-            L"Item/Consume/0238.img/02400704",
-            L"Item/Consume/0238.img/2400704",
-            L"Item/Consume/0238.img/02400704/info",
-            L"Item/Consume/0238.img/02400704/info/mob",
-            // Compare against 0240.img (where 02400xxx items naturally live).
-            L"Item/Consume/0240.img",
-            L"Item/Consume/0240.img/02400704",
-            L"Item/Consume/0240.img/02400704/info/mob",
+            L"Item/Consume/0238.img/02380000",
+            L"Item/Consume/0238.img/02380000/info",
+            L"Item/Consume/0238.img/02380000/info/mob",
+            L"Item/Consume/0238.img/2380000",
+            L"Item/Consume/0238.img/2380000/info/mob",
         };
         for (const wchar_t* p : kProbes) {
             try {
@@ -1170,17 +1165,13 @@ static void MonsterBook_DrawLeftLayer(uint8_t* pBytes) {
         // ZArray uses the V95Ref 8-byte stride (pad0 + p), so .p is the
         // actual card ptr.
         //
-        // CMonsterBookAccessor::SetCount (v95 0x009118F0) stores the card via:
-        //   lea ecx, [eax - 0x50E0]
-        //   mov word ptr [card], cx     ; truncates to low 16 bits
-        //   mov byte ptr [card + 2], bl ; count
-        //
-        // So `*card` holds `(cardId - 0x50E0) & 0xFFFF`. v95 GMS monster book
-        // cards are exclusively in [2380000, 2380401], so the top 16 bits of
-        // (cardId - 0x50E0) are constant 0x0024 across the entire range.
-        // Recovery: cardId = uint16_t(stored) + 0x002450E0 = stored + 2380000.
-        // (Naïve `int16_t(stored) + 0x50E0` is wrong because it sign-extends
-        //  high cardIds and drops the 0x0024 prefix.)
+        // v95's CMonsterBookMan::LoadCard (0x006634b0) populates each card
+        // with the FULL 32-bit cardId at MonsterBookCard+0 (verified by
+        // running the WZ probe: `Item/Consume/0238.img` exists, and the
+        // first card's stored low-16 bits = 0x50E0 matches cardId 2380000
+        // = 0x002450E0). Earlier theory that SetCount truncates to
+        // `(short)(cardId-0x50E0)` is wrong for LoadCard-populated cards
+        // — those write the full int. Read int32 directly.
         const uint32_t cardIdx = pageOffset + static_cast<uint32_t>(i);
         if (cardIdx >= cardCount) continue;
         auto& v95Ref = tabCards[cardIdx];
@@ -1189,10 +1180,9 @@ static void MonsterBook_DrawLeftLayer(uint8_t* pBytes) {
                           i, cardIdx);
             continue;
         }
-        const uint16_t storedRaw = *reinterpret_cast<uint16_t*>(v95Ref.p);
-        const int32_t  cardId    = static_cast<int32_t>(storedRaw) + 2380000;
-        const int32_t  mobId     = MonsterBook_ResolveMobId(cardId);
-        IWzCanvasPtr   pMobCanvas = MonsterBook_LoadMobIcon(mobId);
+        const int32_t cardId = *reinterpret_cast<int32_t*>(v95Ref.p);
+        const int32_t mobId  = MonsterBook_ResolveMobId(cardId);
+        IWzCanvasPtr  pMobCanvas = MonsterBook_LoadMobIcon(mobId);
 
         if (!pMobCanvas) {
             // Resolution failure — paint a dim red inset so the cell still
@@ -1522,35 +1512,34 @@ void CCtrlTab::CreateCtrlFromRect(CWnd* pParent, uint32_t nId,
 // KMST 0x008469C0 (~370 lines, tools/decomp/cache_kmst/008469c0.c).
 // CCtrlLPTab::CreateCtrl iterates the WZ tree at
 // `UI/UIWindow.img/MonsterBook/MainTab/...` and builds a list of
-// CCtrlTab::Info structs (per-area icon canvases, hit rects, "new"/"selected"
-// frame canvases) before chaining to base. Reproducing that loop verbatim
-// requires an additional ~370 lines of COM/WZ ceremony plus reverse-
-// engineering CCtrlTab::Info (no PDB symbol).
+// CCtrlTab::Info structs.
 //
-// For this bundle we ship the minimal port: alloc the buffer, set
-// m_nCurrentTab=0 (start on tab 0 / Maple Island), chain to base CreateCtrl.
-// DrawLeftLayer reads `pLPTab+0x34 = m_nCurrentTab` to pick which tab's
-// cards to render — that read is now safe and returns 0 (default tab).
-// The visual tab strip on the left is invisible because m_aTabsPtr is empty,
-// but the card grid on LAYER[0] does render the tab-0 cards. Future session
-// can flesh out the tab strip iteration.
+// Originally this called CCtrlTab::CreateCtrlFromRect which in turn called
+// CCtrlWnd::CreateCtrl to register LPTab as a child wnd of the parent. That
+// caused crashes when v95's input system dispatched click events through
+// the LPTab — our compiler-generated kinoko C++ vtable for CCtrlLPTab does
+// NOT match v95's expected layout, so OnChildNotify's vtable[8] dispatch
+// (which v95 expects to land on OnButtonClicked) lands inside an unrelated
+// v95 function (CInputSystem::TryAcquireDevice +0x1F9), eventually faulting
+// at garbage memory.
+//
+// Skip the registration entirely. LPTab still exists as a heap object so
+// DrawLeftLayer can read m_nCurrentTab from offset +0x34 (= 0). The visual
+// tab strip on the left is invisible (was already invisible because we
+// skipped the WZ tab tree iteration) and click events on the strip area no
+// longer dispatch through it.
 void CCtrlLPTab::CreateCtrlFromRect(CWnd* pParent, uint32_t nId,
                                     const RECT* pRect, void* pParam) {
-    DEBUG_MESSAGE("CCtrlLPTab::CreateCtrlFromRect: minimal port (skip WZ tab tree)");
-    // Tab 0 (Maple Island) is the default landing tab when /book opens with
-    // no SetCover packet outstanding. KMST also defaults here.
+    DEBUG_MESSAGE("CCtrlLPTab::CreateCtrlFromRect: data-only (no wnd registration)");
     m_nCurrentTab = 0;
-    CCtrlTab::CreateCtrlFromRect(pParent, nId, pRect, pParam);
 }
 
-// KMST 0x008476ED (~290 lines). RPTab is the right-side region selector
-// (regions per area). Same minimal port: chain to base, leave m_aTabsPtr
-// empty.
+// KMST 0x008476ED (~290 lines). Same data-only port as LPTab: don't register
+// as child wnd; just keep m_nCurrentTab=0 readable from the slot.
 void CCtrlRPTab::CreateCtrlFromRect(CWnd* pParent, uint32_t nId,
                                     const RECT* pRect, void* pParam) {
-    DEBUG_MESSAGE("CCtrlRPTab::CreateCtrlFromRect: minimal port (skip WZ region tree)");
+    DEBUG_MESSAGE("CCtrlRPTab::CreateCtrlFromRect: data-only (no wnd registration)");
     m_nCurrentTab = 0;
-    CCtrlTab::CreateCtrlFromRect(pParent, nId, pRect, pParam);
 }
 
 
