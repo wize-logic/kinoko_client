@@ -847,11 +847,61 @@ namespace {
     std::unordered_map<int32_t, int32_t> g_cardToMob;
     std::unordered_map<int32_t, IWzCanvasPtr> g_mobIcon;
 
+    // First-call diagnostic probe: log whether each candidate path resolves
+    // for the FIRST cardId we resolve. Sticky bool guards re-probing.
+    bool g_probedWzRoot = false;
+    void MonsterBook_ProbeWzPaths(int32_t cardId) {
+        if (g_probedWzRoot) return;
+        g_probedWzRoot = true;
+
+        const wchar_t* kProbes[] = {
+            L"Etc/MonsterBook.img",
+            L"Etc.wz/MonsterBook.img",
+            L"MonsterBook.img",
+            L"Etc",
+            L"Etc/MonsterBook",
+        };
+        for (const wchar_t* p : kProbes) {
+            try {
+                Ztl_variant_t v = get_rm()->GetObjectA(Ztl_bstr_t(p));
+                DEBUG_MESSAGE("  WZprobe[%S] -> vt=%u",
+                              p, static_cast<unsigned>(V_VT(&v)));
+            } catch (const _com_error& e) {
+                DEBUG_MESSAGE("  WZprobe[%S] FAIL 0x%08X (%s)",
+                              p, static_cast<unsigned>(e.Error()),
+                              e.ErrorMessage());
+            }
+        }
+
+        // Also probe the cardId leaf under each candidate.img to check whether
+        // the .img exists but the cardId child is the missing piece.
+        wchar_t sPath[80];
+        const wchar_t* kCardLeafs[] = {
+            L"Etc/MonsterBook.img/%d",
+            L"Etc/MonsterBook.img/0%07d",
+        };
+        for (const wchar_t* fmt : kCardLeafs) {
+            swprintf_s(sPath, 80, fmt, cardId);
+            try {
+                Ztl_variant_t v = get_rm()->GetObjectA(Ztl_bstr_t(sPath));
+                DEBUG_MESSAGE("  WZprobe[%S] -> vt=%u",
+                              sPath, static_cast<unsigned>(V_VT(&v)));
+            } catch (const _com_error& e) {
+                DEBUG_MESSAGE("  WZprobe[%S] FAIL 0x%08X",
+                              sPath, static_cast<unsigned>(e.Error()));
+            }
+        }
+    }
+
     int32_t MonsterBook_ResolveMobId(int32_t cardId) {
         auto it = g_cardToMob.find(cardId);
         if (it != g_cardToMob.end()) {
             return it->second;
         }
+        // Diagnostic on first-ever resolve: exhaustive path probe so the next
+        // log run pinpoints the right WZ namespace + cardId-leaf format.
+        MonsterBook_ProbeWzPaths(cardId);
+
         int32_t mobId = 0;
         try {
             wchar_t sPath[64];
