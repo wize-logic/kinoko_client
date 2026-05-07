@@ -1319,26 +1319,6 @@ namespace {
         return -1;
     }
 
-    // Top-of-page tab indicator strip painted by DrawLeftLayer: 9 segments
-    // at LAYER[0]-local (8 + t*0x12, 4) sized (0x10, 0x0C). Returns the tab
-    // index 0..8 if the click landed in one, or -1 otherwise.
-    //
-    // KMST's real LPTab (CCtrlLPTab) on the left edge of the wnd carries the
-    // canonical tab visuals + click handling, but the visuals require a WZ
-    // tab-tree iteration we haven't ported (~660 lines combined). The top
-    // indicator strip we DO paint is the only currently-visible UI cue for
-    // tab state — repurposing it as a click target gives users a working
-    // tab switcher without porting the heavyweight LPTab body.
-    int32_t MonsterBook_TabStripHitTest(int32_t rxLayer, int32_t ryLayer) {
-        if (ryLayer < 4 || ryLayer >= 4 + 0x0C) return -1;
-        for (int t = 0; t < 9; ++t) {
-            const int32_t segX = 8 + t * 0x12;
-            if (rxLayer >= segX && rxLayer < segX + 0x10) {
-                return t;
-            }
-        }
-        return -1;
-    }
 }
 
 // KMST 0x00849F68 (1004 lines). Renders LAYER[0] — the per-tab card grid.
@@ -1406,10 +1386,12 @@ static void MonsterBook_DrawLeftLayer(uint8_t* pBytes) {
         return;
     }
 
-    // Clear the canvas with a dark background — KMST's body redraws every
-    // frame after first dirty so we don't worry about preserving previous.
+    // Clear the card-grid area only — y=0..0x1E (header strip) is left
+    // transparent so the wnd primary canvas's bg artwork (which holds the
+    // search-box rectangle) shows through. KMST's body redraws every frame
+    // after first dirty so we don't worry about preserving previous.
     try {
-        pCanvas->DrawRectangle(0, 0, 0xAE, 0x100, 0xFF202020);
+        pCanvas->DrawRectangle(0, 0x1F, 0xAE, 0x100 - 0x1F, 0xFF202020);
     } catch (const _com_error& e) {
         DEBUG_MESSAGE("  background clear threw 0x%08X (%s)",
                       e.Error(), e.ErrorMessage());
@@ -1506,18 +1488,12 @@ static void MonsterBook_DrawLeftLayer(uint8_t* pBytes) {
         }
     }
 
-    // Tab indicator strip across the top of the page — useful for confirming
-    // m_pLPTab read worked and m_nCurrentTab populated. 9 segments, the
-    // current tab gets a brighter highlight.
-    for (int t = 0; t < 9; ++t) {
-        const int32_t segX = 8 + t * 0x12;
-        const uint32_t color = (t == currentTab) ? 0xFFFFFF40 : 0xFF404040;
-        try {
-            pCanvas->DrawRectangle(segX, 4, 0x10, 0x0C, color);
-        } catch (const _com_error&) { return; }
-    }
+    // Top tab indicator strip removed — superseded by the visible LP/RP
+    // tab strips. Painting colored blocks at y=4 also overlapped the search
+    // box bg artwork (which lives at wnd-local y=30..45 = LAYER[0]-local
+    // y=5..20) and stuck it to opaque colours.
 
-    DEBUG_MESSAGE("  L0 painted: tab=%d, %u/%d cells filled, indicator strip drawn",
+    DEBUG_MESSAGE("  L0 painted: tab=%d, %u/%d cells filled",
                   currentTab, pageCount, kCellsPerPage);
 }
 
@@ -1959,26 +1935,31 @@ static void MonsterBook_DrawTabStrip(IWzGr2DLayer*       pLayer,
         DEBUG_MESSAGE("MonsterBook_DrawTabStrip[%s]: pLayer NULL", tag);
         return;
     }
+
+    // Canvas-swap pattern: build a fresh canvas each repaint and replace
+    // the layer's previous one. Compositing onto the existing canvas leaves
+    // the prior selected-tab pixels intact (alpha=0 in the engine's pipe is
+    // a no-op blend per feedback_canvas_alpha0_clear_no_op), so a tab
+    // change would show TWO highlighted tabs. Same approach as
+    // DrawSelectLayer's cursor swap.
     IWzCanvasPtr pCanvas;
     try {
-        pCanvas = pLayer->canvas[vtEmpty];
+        PcCreateObject<IWzCanvasPtr>(L"Canvas", pCanvas, nullptr);
     } catch (const _com_error& e) {
-        DEBUG_MESSAGE("  [%s] pLayer->canvas threw 0x%08X (%s)",
+        DEBUG_MESSAGE("  [%s] PcCreateObject threw 0x%08X (%s)",
                       tag, e.Error(), e.ErrorMessage());
         return;
     }
     if (!pCanvas) return;
-
-    // Clear strip — transparent fill so the wnd bg artwork shows through any
-    // gaps. Per feedback_canvas_alpha0_clear_no_op alpha=0 doesn't actually
-    // wipe; we paint a fully-transparent rect anyway as a marker, and the
-    // per-tab Copy below leaves un-tab regions still showing the previous
-    // frame. Acceptable since the only thing that changes between paints is
-    // which tab is selected — all 9 (or 4) tab regions get rewritten every
-    // paint, so stale pixels are limited to the gaps between tabs.
     try {
-        pCanvas->DrawRectangle(0, 0, canvasW, canvasH, 0x00000000);
-    } catch (const _com_error&) {}
+        pCanvas->Create(canvasW, canvasH);
+        pCanvas->cx = 0;
+        pCanvas->cy = 0;
+    } catch (const _com_error& e) {
+        DEBUG_MESSAGE("  [%s] fresh canvas Create threw 0x%08X (%s)",
+                      tag, e.Error(), e.ErrorMessage());
+        return;
+    }
 
     int32_t cursorY = 0;
     for (int t = 0; t < tabCount; ++t) {
@@ -2018,6 +1999,23 @@ static void MonsterBook_DrawTabStrip(IWzGr2DLayer*       pLayer,
         ::SetRect(&pOutRects[t], dstX, cursorY, dstX + tabW, cursorY + tabH);
         cursorY += tabH;
     }
+
+    // Swap the layer's canvas: drop the previous frame's painted tabs
+    // (their refcount goes to zero and the COM dtor reclaims the buffer)
+    // and install the freshly-built one with the current selected state.
+    // Without this, the prior selected-tab's pixels persist on top of the
+    // new one — alpha=0 clears in the engine's pipe are no-ops, so reusing
+    // the existing canvas would leave both tabs looking selected after a
+    // click. Same swap pattern as DrawSelectLayer's cursor canvas.
+    try {
+        pLayer->RemoveCanvas(-2);
+        pLayer->InsertCanvas(pCanvas);
+    } catch (const _com_error& e) {
+        DEBUG_MESSAGE("  [%s] canvas swap threw 0x%08X (%s)",
+                      tag, e.Error(), e.ErrorMessage());
+        return;
+    }
+
     DEBUG_MESSAGE("  [%s] strip painted: %d tabs, currentTab=%d",
                   tag, tabCount, currentTab);
 }
@@ -2132,34 +2130,16 @@ static void MonsterBook_Update(uint8_t* pBytes) {
                     g_dirtyRP = 1;                                    // RP strip
                 }
             } else {
-                // Top tab indicator strip on LAYER[0] (kept as a redundant
-                // input path — visible bar at the top of the card grid).
-                const int32_t tabHit = MonsterBook_TabStripHitTest(rxL0, ryL0);
-                if (tabHit >= 0) {
-                    auto* pLPTab = *reinterpret_cast<CCtrlLPTab**>(pBytes + 0x1564);
-                    if (pLPTab && pLPTab->m_nCurrentTab != tabHit) {
-                        DEBUG_MESSAGE("MonsterBook_Update: top-strip click -> tab %d",
-                                      tabHit);
-                        pLPTab->m_nCurrentTab = tabHit;
-                        g_nLeftPage     = 0;
-                        g_nSelectedCard = 0;
-                        *reinterpret_cast<int32_t*>(pBytes + 0x15A0) = 1;
-                        *reinterpret_cast<int32_t*>(pBytes + 0x15A8) = 1;
-                        *reinterpret_cast<int32_t*>(pBytes + 0x15B0) = 1;
-                        g_dirtyLP = 1;
-                    }
-                } else {
-                    // Cell click → update selected card index.
-                    const int32_t cellHit = MonsterBook_CellHitTest(pBytes, rxL0, ryL0);
-                    if (cellHit >= 0 && cellHit != g_nSelectedCard) {
-                        DEBUG_MESSAGE("MonsterBook_Update: cell click -> %d (was %d)",
-                                      cellHit, g_nSelectedCard);
-                        g_nSelectedCard = cellHit;
-                        // Cursor overlay (LAYER[2]) and detail panel (LAYER[1])
-                        // both depend on selection state.
-                        *reinterpret_cast<int32_t*>(pBytes + 0x15A8) = 1;
-                        *reinterpret_cast<int32_t*>(pBytes + 0x15B0) = 1;
-                    }
+                // Cell click → update selected card index.
+                const int32_t cellHit = MonsterBook_CellHitTest(pBytes, rxL0, ryL0);
+                if (cellHit >= 0 && cellHit != g_nSelectedCard) {
+                    DEBUG_MESSAGE("MonsterBook_Update: cell click -> %d (was %d)",
+                                  cellHit, g_nSelectedCard);
+                    g_nSelectedCard = cellHit;
+                    // Cursor overlay (LAYER[2]) and detail panel (LAYER[1])
+                    // both depend on selection state.
+                    *reinterpret_cast<int32_t*>(pBytes + 0x15A8) = 1;
+                    *reinterpret_cast<int32_t*>(pBytes + 0x15B0) = 1;
                 }
             }
         }
