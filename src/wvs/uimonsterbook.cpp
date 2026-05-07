@@ -1196,16 +1196,49 @@ static void MonsterBook_DrawLeftLayer(uint8_t* pBytes) {
         }
 
         try {
-            // Clear the cell interior then composite the mob portrait. KMST
-            // composites at the per-card RECT origin via vfunc 0x80 (Copy),
-            // optional alpha VARIANT controls the blend. We pass full alpha
-            // (0xFF) for collected cards. Cell-interior offset is +1 inside
-            // the border rect so the portrait doesn't overpaint the frame.
+            // Clear the cell interior, then scale the mob portrait into a
+            // cell-sized temporary canvas via CopyEx, and composite the
+            // temp onto the main canvas. Direct Copy() bleeds across cells
+            // because mob portraits are 50-200 px while cells are ~25x35.
+            // CopyEx scales src→dst dims so the entire portrait fits.
+            //
+            // mobW/mobH come from the portrait's natural canvas dims; if
+            // accessor throws (rare for valid portraits), we fall back to
+            // 60x60 which is a typical small-mob size and gives a safe
+            // scale factor for most cards.
+            constexpr int32_t kInsetX = 2;
+            constexpr int32_t kInsetY = 2;
+            constexpr int32_t kInnerW = 0x1B - 2 * kInsetX;  // 23
+            constexpr int32_t kInnerH = 0x26 - 2 * kInsetY;  // 34
+
             pCanvas->DrawRectangle(cellX + 1, cellY + 1,
                                    0x1B - 2, 0x26 - 2, 0xFF000000);
-            pCanvas->Copy(cellX + 1, cellY + 1, pMobCanvas);
+
+            unsigned int mobW = 60, mobH = 60;
+            try {
+                mobW = pMobCanvas->Getwidth();
+                mobH = pMobCanvas->Getheight();
+            } catch (const _com_error&) {
+                // Keep defaults.
+            }
+            if (mobW == 0) mobW = 60;
+            if (mobH == 0) mobH = 60;
+
+            IWzCanvasPtr pTemp;
+            PcCreateObject<IWzCanvasPtr>(L"Canvas", pTemp, nullptr);
+            if (pTemp) {
+                pTemp->Create(static_cast<unsigned long>(kInnerW),
+                              static_cast<unsigned long>(kInnerH));
+                pTemp->CopyEx(0, 0, pMobCanvas, CANVAS_ALPHATYPE::CA_OVERWRITE,
+                              kInnerW, kInnerH,
+                              0, 0,
+                              static_cast<int32_t>(mobW),
+                              static_cast<int32_t>(mobH),
+                              _variant_t());
+                pCanvas->Copy(cellX + kInsetX, cellY + kInsetY, pTemp);
+            }
         } catch (const _com_error& e) {
-            DEBUG_MESSAGE("  cell %d card=%d mob=%d: Copy threw 0x%08X (%s)",
+            DEBUG_MESSAGE("  cell %d card=%d mob=%d: composite threw 0x%08X (%s)",
                           i, cardId, mobId,
                           static_cast<unsigned>(e.Error()), e.ErrorMessage());
         }
