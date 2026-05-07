@@ -1443,26 +1443,36 @@ static void MonsterBook_DrawSelectLayer(uint8_t* pBytes) {
         return;
     }
 
+    // Build a fresh working canvas each repaint and swap it into LAYER[2]
+    // — KMST's pattern (PcCreateObject + Create + composite + InsertCanvas).
+    // Compositing onto LAYER[2]'s existing canvas leaves last-frame's
+    // cursor pixels intact: DrawRectangle(... 0x00000000) doesn't actually
+    // wipe — alpha=0 in the engine's fixed alpha pipe is a no-op blend, so
+    // previous opaque cursor pixels survive the "clear". Replacing the
+    // canvas wholesale is the cleanest fix, and only fires when LAYER[2]
+    // is dirtied (selection / tab change), so per-frame allocation cost is
+    // negligible.
     IWzCanvasPtr pCanvas;
     try {
-        pCanvas = pLayer->canvas[vtEmpty];
+        PcCreateObject<IWzCanvasPtr>(L"Canvas", pCanvas, nullptr);
     } catch (const _com_error& e) {
-        DEBUG_MESSAGE("  pLayer->canvas threw 0x%08X (%s)",
-                      e.Error(), e.ErrorMessage());
+        DEBUG_MESSAGE("  PcCreateObject(L\"Canvas\") threw 0x%08X (%s)",
+                      static_cast<unsigned>(e.Error()), e.ErrorMessage());
         return;
     }
     if (!pCanvas) {
-        DEBUG_MESSAGE("  LAYER[2] canvas is NULL");
+        DEBUG_MESSAGE("  PcCreateObject returned null fresh canvas");
         return;
     }
-
-    // Clear the cursor canvas so prior frames' selection at a different
-    // index doesn't ghost. ARGB 0 = fully transparent — LAYER[2] composites
-    // over LAYER[0] with alpha so transparent regions show the card grid
-    // beneath unobstructed.
     try {
-        pCanvas->DrawRectangle(0, 0, 0xAE, 0x100, 0x00000000);
-    } catch (const _com_error&) { return; }
+        pCanvas->Create(0xAE, 0x100);
+        pCanvas->cx = 0;
+        pCanvas->cy = 0;
+    } catch (const _com_error& e) {
+        DEBUG_MESSAGE("  fresh canvas Create threw 0x%08X (%s)",
+                      static_cast<unsigned>(e.Error()), e.ErrorMessage());
+        return;
+    }
 
     // Cache the "select" cursor canvas — single WZ load for the entire
     // process lifetime. Function-local static: the strong COM ref persists
@@ -1480,10 +1490,6 @@ static void MonsterBook_DrawSelectLayer(uint8_t* pBytes) {
                           static_cast<unsigned>(e.Error()), e.ErrorMessage());
         }
     }
-    if (!s_pSelectCanvas) {
-        DEBUG_MESSAGE("  no select canvas — abort");
-        return;
-    }
 
     // Clamp + read m_aRect[g_nSelectedCard]. m_aRect is a 25-entry array of
     // 16-byte RECT structs at +0x15B8. KMST's offset arithmetic in the
@@ -1494,10 +1500,26 @@ static void MonsterBook_DrawSelectLayer(uint8_t* pBytes) {
 
     // KMST composites at (rect.left - 2, rect.top - 2) — 2-px inset so the
     // cursor frame surrounds the cell rather than nesting inside it.
+    if (s_pSelectCanvas) {
+        try {
+            pCanvas->Copy(pRect->left - 2, pRect->top - 2, s_pSelectCanvas);
+        } catch (const _com_error& e) {
+            DEBUG_MESSAGE("  Copy threw 0x%08X (%s)",
+                          static_cast<unsigned>(e.Error()), e.ErrorMessage());
+            return;
+        }
+    }
+
+    // Swap the layer's canvas: drop whatever was there last frame
+    // (releases its refcount) and install our fresh one with just the
+    // current cursor on it. -2 = remove-all (kinoko convention; see
+    // temporarystat.cpp:129 — same idiom for replacing a layer canvas
+    // with a freshly-built one).
     try {
-        pCanvas->Copy(pRect->left - 2, pRect->top - 2, s_pSelectCanvas);
+        pLayer->RemoveCanvas(-2);
+        pLayer->InsertCanvas(pCanvas);
     } catch (const _com_error& e) {
-        DEBUG_MESSAGE("  Copy threw 0x%08X (%s)",
+        DEBUG_MESSAGE("  layer canvas swap threw 0x%08X (%s)",
                       static_cast<unsigned>(e.Error()), e.ErrorMessage());
         return;
     }
