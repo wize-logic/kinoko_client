@@ -8,6 +8,7 @@
 #include "wvs/ctrlwnd.h"
 #include "wvs/util.h"
 #include "wvs/wnd.h"
+#include "wvs/wvscontext.h"
 
 #include <algorithm>
 #include <cctype>
@@ -15,6 +16,7 @@
 #include <cwchar>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 
 // === Layout / sizing ========================================================
@@ -144,6 +146,50 @@ namespace {
     // (matches CCtrlButton dispatch). On the falling edge we hit-test the
     // cached (g_nLastHitX, g_nLastHitY) against m_aRect[0..24].
     bool     g_bLeftBtnDown  = false;
+
+    // Per-tab visual canvases for the LP/RP tab strips. Loaded from
+    // UI/UIWindow.img/MonsterBook/LeftTab/<idx>/{normal,selected}/0 (LP, 9 tabs)
+    // and RightTab/<idx>/{normal,selected}/0 (RP, 4 tabs). KMST stores these
+    // inside CCtrlTab::Info (per-tab struct in m_aTabsPtr); we keep them as
+    // module-scope statics since only one MonsterBook is open at a time and
+    // adding the Info struct + ZArray inner type would explode the port. Both
+    // strips share the same paint path (DrawTabStripLayer) — only the source
+    // array + tab count differ.
+    IWzCanvasPtr g_lpTabIcons[9][2];   // [tab][0=normal, 1=selected]
+    IWzCanvasPtr g_rpTabIcons[4][2];
+
+    // 4th + 5th IWzGr2DLayer slots for the LP/RP tab strips. KMST's CCtrlLPTab
+    // / CCtrlRPTab build their own sublayer at the parent wnd's layer with
+    // KMST rects (-7, 25, 50, 305) and (439, 25, 506, 220) respectively. We
+    // mirror that with our own layers — held as module statics rather than at
+    // verified buffer offsets since adding more dirty/slot pairs at unverified
+    // CUIMonsterBook offsets risks colliding with members KMST/v95 own. Built
+    // in MonsterBook_CreateExtraLayers, freed in PreDestroy.
+    IWzGr2DLayer* g_pLPLayer = nullptr;
+    IWzGr2DLayer* g_pRPLayer = nullptr;
+    int32_t       g_dirtyLP = 0;
+    int32_t       g_dirtyRP = 0;
+
+    // Per-cell rects in LP/RP-layer-local coords for hit-testing tab clicks.
+    // Populated when the layer + per-tab canvases are built; LP layer is
+    // 57 wide x 280 tall, RP layer is 67 wide x 195 tall. Each cell stacks
+    // vertically with its actual canvas size (varies per tab) — built once
+    // per /book open.
+    RECT g_aLPTabRects[9] = {};
+    RECT g_aRPTabRects[4] = {};
+
+    // Search state — collected matches so re-clicking the search button
+    // cycles through them rather than always returning to the first hit.
+    // Rebuilt when query text changes; advanced (mod count) when the same
+    // query is re-submitted.
+    struct SearchHit {
+        int32_t tab;
+        int32_t page;
+        int32_t cell;
+    };
+    std::vector<SearchHit> g_searchMatches;
+    size_t      g_searchIndex = 0;
+    std::string g_searchQueryActive;
 }
 
 
@@ -509,6 +555,131 @@ static void MonsterBook_CreateLayer(void* pThis) {
     DEBUG_MESSAGE("MonsterBook_CreateLayer: all 3 layers built ok");
 }
 
+// Build the 4th + 5th IWzGr2DLayer slots used by the visible LP/RP tab
+// strips. KMST routes these through CCtrlLPTab::CreateCtrl /
+// CCtrlRPTab::CreateCtrl which build their own sublayer + canvas under the
+// parent wnd's layer. We can't go through the same KMST wnd-registration
+// path because kinoko's compiler-generated CCtrlWnd vtable doesn't match
+// v95's expected slot layout (see feedback_kinoko_cppvtable_no_v95_register
+// — we ship LP/RP as data-only objects). Instead we build the layers
+// directly here, mirroring KMST's geometry, and keep the layer pointers in
+// module statics so paint + hit-test paths can reach them without
+// dispatching through CCtrlTab.
+//
+// LP layer covers wnd-local rect (-7, 25, 50, 305) — 57x280, 9 tabs vertical.
+// RP layer covers wnd-local rect (439, 25, 506, 220) — 67x195, 4 tabs vertical.
+//
+// Both layers share the parent wnd's layer + Filter VARIANT pattern from
+// MonsterBook_CreateLayer. Returns silently on failure (CreateLayer drops
+// dim-red fallback in DrawLeftLayer, but LP/RP failure just leaves the
+// strips invisible — the top tab indicator on LAYER[0] still works).
+static void MonsterBook_CreateExtraLayers(void* pThis) {
+    DEBUG_MESSAGE("MonsterBook_CreateExtraLayers: enter pThis=0x%08X", pThis);
+
+    auto* pCWnd = reinterpret_cast<CWnd*>(pThis);
+
+    IWzGr2DLayerPtr pParentLayer;
+    try {
+        pParentLayer = pCWnd->GetLayer();
+    } catch (const _com_error& e) {
+        DEBUG_MESSAGE("  GetLayer threw 0x%08X (%s)", e.Error(), e.ErrorMessage());
+        return;
+    }
+    if (!pParentLayer) {
+        DEBUG_MESSAGE("  GetLayer returned NULL — abort extra-layer build");
+        return;
+    }
+
+    long parentZ = 0;
+    try { parentZ = pParentLayer->z; } catch (const _com_error&) {}
+
+    IWzGr2DPtr& pGr = get_gr();
+    if (!pGr) {
+        DEBUG_MESSAGE("  _g_gr is NULL — abort extra-layer build");
+        return;
+    }
+
+    Ztl_variant_t vParent(static_cast<IUnknown*>(pParentLayer.GetInterfacePtr()));
+    Ztl_variant_t vFilter(0L, VT_I4);
+
+    struct ExtraLayerSpec {
+        const char*    tag;
+        IWzGr2DLayer** pSlot;
+        long           layerLeft;
+        long           layerTop;
+        long           zOffset;
+        unsigned long  canvasWidth;
+        unsigned long  canvasHeight;
+    };
+    // KMST CCtrlLPTab/CCtrlRPTab assign z=parent+2 (matching the L1/L2 z so
+    // the strips composite over the bg artwork). We pick z=parent+2 too.
+    ExtraLayerSpec kExtras[] = {
+        { "LP", &g_pLPLayer, -7,  25, 2, 57, 280 },
+        { "RP", &g_pRPLayer, 439, 25, 2, 67, 195 },
+    };
+
+    for (auto& spec : kExtras) {
+        DEBUG_MESSAGE("  [%s] begin: pos=(%ld,%ld) canvas=%lux%lu",
+                      spec.tag, spec.layerLeft, spec.layerTop,
+                      spec.canvasWidth, spec.canvasHeight);
+
+        IWzGr2DLayerPtr pNewLayer;
+        try {
+            pNewLayer = pGr->CreateLayer(
+                spec.layerLeft, spec.layerTop,
+                /*uWidth=*/0, /*uHeight=*/0,
+                /*nZ=*/0, vtEmpty, vFilter);
+        } catch (const _com_error& e) {
+            DEBUG_MESSAGE("    pGr->CreateLayer threw 0x%08X (%s)",
+                          e.Error(), e.ErrorMessage());
+            continue;
+        }
+        if (!pNewLayer) continue;
+
+        IWzGr2DLayer* pRaw = pNewLayer.GetInterfacePtr();
+        pRaw->AddRef();
+        *spec.pSlot = pRaw;
+
+        try {
+            pNewLayer->origin  = vParent;
+            pNewLayer->overlay = vParent;
+            pNewLayer->color   = 0xFFFFFFFFUL;
+            pNewLayer->z       = parentZ + spec.zOffset;
+        } catch (const _com_error& e) {
+            DEBUG_MESSAGE("    layer setters threw 0x%08X (%s)",
+                          e.Error(), e.ErrorMessage());
+            continue;
+        }
+
+        IWzCanvasPtr pCanvas;
+        try {
+            PcCreateObject<IWzCanvasPtr>(L"Canvas", pCanvas, nullptr);
+        } catch (const _com_error& e) {
+            DEBUG_MESSAGE("    PcCreateObject threw 0x%08X (%s)",
+                          e.Error(), e.ErrorMessage());
+            continue;
+        }
+        if (!pCanvas) continue;
+
+        try {
+            pCanvas->Create(spec.canvasWidth, spec.canvasHeight);
+            pCanvas->cx = 0;
+            pCanvas->cy = 0;
+            pNewLayer->InsertCanvas(pCanvas);
+        } catch (const _com_error& e) {
+            DEBUG_MESSAGE("    canvas setup threw 0x%08X (%s)",
+                          e.Error(), e.ErrorMessage());
+            continue;
+        }
+
+        DEBUG_MESSAGE("  [%s] done: pLayer=0x%08X", spec.tag, pRaw);
+    }
+
+    // Mark both dirty so the first Update tick paints them.
+    g_dirtyLP = 1;
+    g_dirtyRP = 1;
+}
+
 // KMST 0x0084988E (32 lines) — tools/decomp/cache_kmst/0084988e.c.
 //
 // Two flat RECT arrays for HitTest:
@@ -747,6 +918,12 @@ static void MonsterBook_Construct(void* pThis) {
     MonsterBook_CreateRect(pThis);
     MonsterBook_CreateCardTable(pThis);
     MonsterBook_CreateFontArray(pThis);
+    // Extra LP/RP tab-strip layers — must run AFTER CreateCtrl populates
+    // m_pLPTab / m_pRPTab (those slots' WZ-icon load happens inside
+    // CCtrlLPTab/CCtrlRPTab::CreateCtrlFromRect, and the paint paths in
+    // MonsterBook_DrawLPLayer/DrawRPLayer require both the layer slots and
+    // the per-tab icons populated).
+    MonsterBook_CreateExtraLayers(pThis);
     DEBUG_MESSAGE("MonsterBook_Construct: builders done");
 }
 
@@ -855,6 +1032,38 @@ static void MonsterBook_PreDestroy(void* pThis) {
     // and a small cardId→mobId map; both rebuild on next /book open.
     MonsterBook_ClearPortraitCache();
 
+    // LP/RP tab strip resources — extra IWzGr2DLayer slots (raw COM refs)
+    // and per-tab icon arrays (smart pointers; assigning nullptr triggers
+    // Release). Clear both so /book reopen rebuilds clean.
+    if (g_pLPLayer) {
+        DEBUG_MESSAGE("  releasing g_pLPLayer=0x%08X", g_pLPLayer);
+        g_pLPLayer->Release();
+        g_pLPLayer = nullptr;
+    }
+    if (g_pRPLayer) {
+        DEBUG_MESSAGE("  releasing g_pRPLayer=0x%08X", g_pRPLayer);
+        g_pRPLayer->Release();
+        g_pRPLayer = nullptr;
+    }
+    for (int t = 0; t < 9; ++t) {
+        g_lpTabIcons[t][0] = nullptr;
+        g_lpTabIcons[t][1] = nullptr;
+    }
+    for (int t = 0; t < 4; ++t) {
+        g_rpTabIcons[t][0] = nullptr;
+        g_rpTabIcons[t][1] = nullptr;
+    }
+    g_dirtyLP = 0;
+    g_dirtyRP = 0;
+    for (auto& r : g_aLPTabRects) ::SetRectEmpty(&r);
+    for (auto& r : g_aRPTabRects) ::SetRectEmpty(&r);
+
+    // Search session state — clears so a stale match list from the prior
+    // /book session doesn't persist into the next.
+    g_searchMatches.clear();
+    g_searchIndex = 0;
+    g_searchQueryActive.clear();
+
     DEBUG_MESSAGE("MonsterBook_PreDestroy: done");
 }
 
@@ -871,10 +1080,21 @@ static void MonsterBook_PreDestroy(void* pThis) {
 // (typically ~33x33 px). Cached per-cardId; cleared by MonsterBook_PreDestroy.
 
 namespace {
-    std::unordered_map<int32_t, IWzCanvasPtr> g_cardIcon;
-    std::unordered_map<int32_t, int32_t>      g_cardToMobId;
-    std::unordered_map<int32_t, IWzCanvasPtr> g_mobPortrait;
-    std::unordered_map<int32_t, std::string>  g_mobName;
+    // Per-mob stat block sourced from Mob/<padded>.img/info/{level,exp,maxHP}.
+    // Cached per-mobId; rebuilt next /book open if user adds new cards in-
+    // between. INT32_MIN sentinel for "WZ probe failed / no value" so callers
+    // can suppress the row rather than printing zeros.
+    struct MobInfoData {
+        int32_t level;
+        int32_t exp;
+        int32_t maxHP;
+    };
+
+    std::unordered_map<int32_t, IWzCanvasPtr>  g_cardIcon;
+    std::unordered_map<int32_t, int32_t>       g_cardToMobId;
+    std::unordered_map<int32_t, IWzCanvasPtr>  g_mobPortrait;
+    std::unordered_map<int32_t, std::string>   g_mobName;
+    std::unordered_map<int32_t, MobInfoData>   g_mobInfo;
 
     // Load and cache the per-cardId card-art icon canvas. The path
     // `Item/Consume/0238.img/<cardId>/info/iconRaw` (zero-padded 8-digit)
@@ -953,6 +1173,34 @@ namespace {
         g_cardToMobId.clear();
         g_mobPortrait.clear();
         g_mobName.clear();
+        g_mobInfo.clear();
+    }
+
+    // Resolve mobId → {level, exp, maxHP} via Mob/<padded>.img/info int props.
+    // Cached per-mobId. Returns sentinel (-1, -1, -1) on probe failure.
+    const MobInfoData& MonsterBook_LookupMobInfo(int32_t mobId) {
+        auto it = g_mobInfo.find(mobId);
+        if (it != g_mobInfo.end()) return it->second;
+        MobInfoData data{ -1, -1, -1 };
+        if (mobId > 0) {
+            try {
+                wchar_t sPath[80];
+                swprintf_s(sPath, 80, L"Mob/%07d.img/info", mobId);
+                IWzPropertyPtr pInfo =
+                    get_unknown(get_rm()->GetObjectA(Ztl_bstr_t(sPath)));
+                if (pInfo) {
+                    data.level = static_cast<int32_t>(
+                        get_int32(pInfo->item[L"level"], -1));
+                    data.exp   = static_cast<int32_t>(
+                        get_int32(pInfo->item[L"exp"], -1));
+                    data.maxHP = static_cast<int32_t>(
+                        get_int32(pInfo->item[L"maxHP"], -1));
+                }
+            } catch (const _com_error&) {
+                /* leave sentinel */
+            }
+        }
+        return g_mobInfo.emplace(mobId, data).first->second;
     }
 
     // Resolve mobId → display name via String.wz/Mob.img/<mobId>/name.
@@ -1319,6 +1567,27 @@ static void MonsterBook_DrawRightLayer(uint8_t* pBytes) {
         pCanvas->DrawRectangle(kPanelW - 1, 0, 1, kPanelH, 0xFF80C0FF);
     } catch (const _com_error&) { return; }
 
+    // Search-result count banner — painted at the top of the panel ABOVE
+    // any selection-dependent paint, so an empty match list still renders
+    // visible "0 / 0" feedback. Active iff g_searchQueryActive non-empty
+    // (cleared by an empty-text submit or by /book reopen).
+    auto* pFontTopArr = reinterpret_cast<ZArray<IWzFontPtr>*>(pBytes + 0xE64);
+    IWzFontPtr pFontTop =
+        (pFontTopArr->GetCount() > 0) ? (*pFontTopArr)[0] : nullptr;
+    if (pFontTop && !g_searchQueryActive.empty()) {
+        wchar_t sCount[64];
+        if (g_searchMatches.empty()) {
+            swprintf_s(sCount, 64, L"0 / 0 matches");
+        } else {
+            swprintf_s(sCount, 64, L"%u / %u matches",
+                       static_cast<unsigned>(g_searchIndex + 1),
+                       static_cast<unsigned>(g_searchMatches.size()));
+        }
+        try {
+            pCanvas->DrawTextA(8, 4, sCount, pFontTop);
+        } catch (const _com_error&) {}
+    }
+
     // Resolve currently-selected card. Match the index path DrawLeftLayer
     // uses to read the card grid: m_aCardTable[currentTab][page*25 + idx].
     auto* pLPTab = *reinterpret_cast<CCtrlLPTab**>(pBytes + 0x1564);
@@ -1385,25 +1654,85 @@ static void MonsterBook_DrawRightLayer(uint8_t* pBytes) {
         }
     }
 
-    // Mob walking-sprite directly below the card-art. Native size — most
-    // mobs are 50-150 px wide, fits inside our 220-wide panel. Centered.
+    // Resolve mobId once — name + info + portrait all share it.
     const int32_t mobId = MonsterBook_ResolveMobId(cardId);
+
+    // Visual divider just below the card-art block.
+    try {
+        pCanvas->DrawRectangle(8, 33 * 3 + 16, kPanelW - 16, 1, 0xFF606060);
+    } catch (const _com_error&) {}
+
+    // Text labels: name (centered) above stat lines (left-aligned). KMST's
+    // CUIMonsterBook pre-loads 8 IWzFont slots into m_aFonts; v95 GMS doesn't
+    // bind faces (Korean strings) so slots 0/1 carry get_basic_font(1) and
+    // (0x43) — those are guaranteed-resolvable on any locale and good enough
+    // for ASCII mob names + integers. Slot 0 (basic_font(1)) is the default
+    // pick.
+    auto* pFontArray = reinterpret_cast<ZArray<IWzFontPtr>*>(pBytes + 0xE64);
+    IWzFontPtr pFont = (pFontArray->GetCount() > 0) ? (*pFontArray)[0] : nullptr;
+
+    const std::string& mobName = MonsterBook_LookupMobName(mobId);
+    const MobInfoData& mobInfo = MonsterBook_LookupMobInfo(mobId);
+
+    constexpr int kTextX     = 12;
+    constexpr int kNameY     = 33 * 3 + 22;   // 121 — just below divider
+    constexpr int kStatBaseY = 33 * 3 + 38;   // 137
+    constexpr int kStatLineH = 14;
+
+    if (pFont) {
+        // Mob name — large/centered above stats. swprintf to wide for the BSTR
+        // wrapper (DrawTextA's `A` suffix is the #import-generated alias to
+        // bypass Win32's `DrawText` macro, NOT a single-byte char taker —
+        // see helper.cpp:154 for the same pattern).
+        if (!mobName.empty()) {
+            wchar_t sName[160];
+            ::MultiByteToWideChar(CP_ACP, 0, mobName.c_str(), -1,
+                                  sName, sizeof(sName) / sizeof(sName[0]));
+            try {
+                pCanvas->DrawTextA(kTextX, kNameY, sName, pFont);
+            } catch (const _com_error& e) {
+                DEBUG_MESSAGE("  DrawText(name) threw 0x%08X (%s)",
+                              e.Error(), e.ErrorMessage());
+            }
+        }
+
+        // Level / HP / EXP rows. Skip rows whose probe failed (sentinel -1)
+        // so we don't print misleading zeros.
+        wchar_t sLine[80];
+        int rowY = kStatBaseY;
+        if (mobInfo.level >= 0) {
+            swprintf_s(sLine, 80, L"Level: %d", mobInfo.level);
+            try { pCanvas->DrawTextA(kTextX, rowY, sLine, pFont); }
+            catch (const _com_error&) {}
+            rowY += kStatLineH;
+        }
+        if (mobInfo.maxHP >= 0) {
+            swprintf_s(sLine, 80, L"HP: %d", mobInfo.maxHP);
+            try { pCanvas->DrawTextA(kTextX, rowY, sLine, pFont); }
+            catch (const _com_error&) {}
+            rowY += kStatLineH;
+        }
+        if (mobInfo.exp >= 0) {
+            swprintf_s(sLine, 80, L"EXP: %d", mobInfo.exp);
+            try { pCanvas->DrawTextA(kTextX, rowY, sLine, pFont); }
+            catch (const _com_error&) {}
+            rowY += kStatLineH;
+        }
+    }
+
+    // Mob walking-sprite directly below the stat block. Native size — most
+    // mobs are 50-150 px wide, fits inside our 220-wide panel. Centered.
     IWzCanvasPtr pMob = MonsterBook_LoadMobPortrait(mobId);
     if (pMob) {
         try {
             const int dstX = static_cast<int>(kPanelW) / 2;
-            const int dstY = 33 * 3 + 24;  // below the card-art block
+            const int dstY = 33 * 3 + 96;  // 195 — below the 3-row stat block
             pCanvas->Copy(dstX, dstY, pMob);
         } catch (const _com_error& e) {
             DEBUG_MESSAGE("  mob portrait blit threw 0x%08X (%s)",
                           e.Error(), e.ErrorMessage());
         }
     }
-
-    // Visual divider between card-art and mob portrait.
-    try {
-        pCanvas->DrawRectangle(8, 33 * 3 + 16, kPanelW - 16, 1, 0xFF606060);
-    } catch (const _com_error&) {}
 }
 
 // KMST 0x0084B3A0 (276 lines). Renders LAYER[2] — the selection cursor
@@ -1491,6 +1820,84 @@ static void MonsterBook_DrawSelectLayer(uint8_t* pBytes) {
         }
     }
 
+    // KMST DrawSelectLayer composites the cover overlay BEFORE the select
+    // cursor (cover blends as a stationary highlight, select frames over it
+    // when the user navigates to the cover card). Match that order so a
+    // cover-card-on-the-current-page renders both overlays cleanly.
+    //
+    // Cover-cardId source: CUserLocal::SetMonsterBookCover (v95 0x00908DD0)
+    // writes `*(int32_t*)(pCharData + 0x6E9) = cardId` — see disasm at
+    // 0x00908DF4 `mov dword ptr [eax + 0x6e9], ecx`. Read the same slot via
+    // CWvsContext::GetInstance()->m_pCharacterData. Zero is the no-cover
+    // sentinel (matches v95's UpdateUI tab=9 skip pattern).
+    static IWzCanvasPtr s_pCoverCanvas;
+    if (!s_pCoverCanvas) {
+        try {
+            s_pCoverCanvas = get_unknown(get_rm()->GetObjectA(
+                Ztl_bstr_t(L"UI/UIWindow.img/MonsterBook/cover")));
+            DEBUG_MESSAGE("  loaded cover canvas -> 0x%08X",
+                          s_pCoverCanvas.GetInterfacePtr());
+        } catch (const _com_error& e) {
+            DEBUG_MESSAGE("  load /cover threw 0x%08X (%s)",
+                          static_cast<unsigned>(e.Error()), e.ErrorMessage());
+        }
+    }
+
+    int32_t coverCardId = 0;
+    {
+        auto* pCtx = CWvsContext::GetInstance();
+        if (pCtx) {
+            CharacterData* pChar = pCtx->m_pCharacterData;
+            if (pChar) {
+                coverCardId = *reinterpret_cast<int32_t*>(
+                    reinterpret_cast<uint8_t*>(pChar) + 0x6E9);
+            }
+        }
+    }
+
+    // If a cover is set, walk m_aCardTable to find which (tab, idx) it lives
+    // at. KMST uses CMonsterBookMan::GetCard(cardId) which v95 stripped; we
+    // do a flat O(N) scan over the 9 per-tab arrays — N ≤ 401 for full v95
+    // GMS card coverage so it's fine on every dirty paint.
+    if (s_pCoverCanvas && coverCardId != 0) {
+        auto* pLPTab = *reinterpret_cast<CCtrlLPTab**>(pBytes + 0x1564);
+        const int32_t currentTab = pLPTab ? pLPTab->m_nCurrentTab : -1;
+        auto* pCardTableArrays =
+            reinterpret_cast<ZArray<V95Ref>*>(pBytes + 0x1888);
+        bool found = false;
+        for (int tab = 0; tab < 9 && !found; ++tab) {
+            auto& tabCards = pCardTableArrays[tab];
+            const uint32_t cnt = tabCards.GetCount();
+            for (uint32_t i = 0; i < cnt; ++i) {
+                if (!tabCards[i].p) continue;
+                if (*reinterpret_cast<int32_t*>(tabCards[i].p) == coverCardId) {
+                    // Found — only paint if it's on the user's current view.
+                    const int32_t idxOnTab = static_cast<int32_t>(i);
+                    if (tab == currentTab &&
+                        (idxOnTab / 25) == g_nLeftPage) {
+                        const int32_t cellIdx = idxOnTab % 25;
+                        auto* pCoverRect = reinterpret_cast<RECT*>(
+                            pBytes + 0x15B8 + cellIdx * sizeof(RECT));
+                        try {
+                            pCanvas->Copy(pCoverRect->left - 2,
+                                          pCoverRect->top - 2,
+                                          s_pCoverCanvas);
+                            DEBUG_MESSAGE(
+                                "  cover overlay: card=%d at tab=%d idx=%d cell=%d",
+                                coverCardId, tab, idxOnTab, cellIdx);
+                        } catch (const _com_error& e) {
+                            DEBUG_MESSAGE("  cover Copy threw 0x%08X (%s)",
+                                          static_cast<unsigned>(e.Error()),
+                                          e.ErrorMessage());
+                        }
+                    }
+                    found = true;
+                    break;
+                }
+            }
+        }
+    }
+
     // Clamp + read m_aRect[g_nSelectedCard]. m_aRect is a 25-entry array of
     // 16-byte RECT structs at +0x15B8. KMST's offset arithmetic in the
     // disasm: `local_20 + idx * 0x10 + 0xF18` = `&m_aRect[idx]`.
@@ -1529,6 +1936,107 @@ static void MonsterBook_DrawSelectLayer(uint8_t* pBytes) {
                   pRect->right, pRect->bottom);
 }
 
+// Generic per-strip painter for the LP/RP tab columns. Called by
+// MonsterBook_DrawLPLayer / DrawRPLayer with the relevant pLayer + per-tab
+// icon array + tab count. For each tab, compose its {normal, selected}
+// canvas onto the strip vertically; build the per-tab hit-test rect in the
+// caller-supplied array using each canvas's actual height (KMST stacks
+// non-uniformly when tab icons differ in size).
+//
+// Rect arrays are LP/RP-layer-local. The click polling loop in
+// MonsterBook_Update converts a wnd-local cursor to layer-local by
+// subtracting the layer's wnd-relative origin (LP at -7,25 ; RP at 439,25)
+// before checking PtInRect.
+static void MonsterBook_DrawTabStrip(IWzGr2DLayer*       pLayer,
+                                     unsigned long       canvasW,
+                                     unsigned long       canvasH,
+                                     const IWzCanvasPtr* pIcons,    // [tab][2]
+                                     int                 tabCount,
+                                     int                 currentTab,
+                                     RECT*               pOutRects,
+                                     const char*         tag) {
+    if (!pLayer) {
+        DEBUG_MESSAGE("MonsterBook_DrawTabStrip[%s]: pLayer NULL", tag);
+        return;
+    }
+    IWzCanvasPtr pCanvas;
+    try {
+        pCanvas = pLayer->canvas[vtEmpty];
+    } catch (const _com_error& e) {
+        DEBUG_MESSAGE("  [%s] pLayer->canvas threw 0x%08X (%s)",
+                      tag, e.Error(), e.ErrorMessage());
+        return;
+    }
+    if (!pCanvas) return;
+
+    // Clear strip — transparent fill so the wnd bg artwork shows through any
+    // gaps. Per feedback_canvas_alpha0_clear_no_op alpha=0 doesn't actually
+    // wipe; we paint a fully-transparent rect anyway as a marker, and the
+    // per-tab Copy below leaves un-tab regions still showing the previous
+    // frame. Acceptable since the only thing that changes between paints is
+    // which tab is selected — all 9 (or 4) tab regions get rewritten every
+    // paint, so stale pixels are limited to the gaps between tabs.
+    try {
+        pCanvas->DrawRectangle(0, 0, canvasW, canvasH, 0x00000000);
+    } catch (const _com_error&) {}
+
+    int32_t cursorY = 0;
+    for (int t = 0; t < tabCount; ++t) {
+        const auto* pSrcArr = &pIcons[t * 2];
+        // Use selected canvas for the active tab, normal otherwise.
+        IWzCanvas* pSrc = (t == currentTab && pSrcArr[1])
+                        ? pSrcArr[1].GetInterfacePtr()
+                        : pSrcArr[0].GetInterfacePtr();
+        int32_t tabH = 28;          // fallback if WZ load failed
+        int32_t tabW = canvasW - 4; // narrow margin
+        if (pSrc) {
+            try {
+                tabW = static_cast<int32_t>(pSrc->width);
+                tabH = static_cast<int32_t>(pSrc->height);
+            } catch (const _com_error&) {}
+        }
+        // Center horizontally within the strip.
+        const int32_t dstX = (static_cast<int32_t>(canvasW) - tabW) / 2;
+        if (pSrc) {
+            try {
+                pCanvas->Copy(dstX, cursorY, pSrc);
+            } catch (const _com_error& e) {
+                DEBUG_MESSAGE("    [%s] tab %d Copy threw 0x%08X (%s)",
+                              tag, t, e.Error(), e.ErrorMessage());
+            }
+        } else {
+            // No canvas — paint a placeholder block so click-target is still
+            // visually present.
+            try {
+                pCanvas->DrawRectangle(dstX, cursorY, tabW, tabH,
+                                       (t == currentTab) ? 0xFFFFFF40 : 0xFF606060);
+            } catch (const _com_error&) {}
+        }
+        ::SetRect(&pOutRects[t], dstX, cursorY, dstX + tabW, cursorY + tabH);
+        cursorY += tabH;
+    }
+    DEBUG_MESSAGE("  [%s] strip painted: %d tabs, currentTab=%d",
+                  tag, tabCount, currentTab);
+}
+
+// LP strip — 9 area tabs along the wnd's left edge.
+static void MonsterBook_DrawLPLayer(uint8_t* pBytes) {
+    auto* pLPTab = *reinterpret_cast<CCtrlLPTab**>(pBytes + 0x1564);
+    const int32_t currentTab = pLPTab ? pLPTab->m_nCurrentTab : 0;
+    MonsterBook_DrawTabStrip(g_pLPLayer, 57, 280,
+                             &g_lpTabIcons[0][0], 9, currentTab,
+                             g_aLPTabRects, "LP");
+}
+
+// RP strip — 4 region tabs along the wnd's right edge.
+static void MonsterBook_DrawRPLayer(uint8_t* pBytes) {
+    auto* pRPTab = *reinterpret_cast<CCtrlRPTab**>(pBytes + 0x156C);
+    const int32_t currentTab = pRPTab ? pRPTab->m_nCurrentTab : 0;
+    MonsterBook_DrawTabStrip(g_pRPLayer, 67, 195,
+                             &g_rpTabIcons[0][0], 4, currentTab,
+                             g_aRPTabRects, "RP");
+}
+
 // KMST CUIMonsterBook::DrawLayer (0x0084CBE7) dispatcher. Verbatim port —
 // 3-way switch on the layer index passed by Update.
 static void MonsterBook_DrawLayer(uint8_t* pBytes, int layerIdx) {
@@ -1565,44 +2073,85 @@ static void MonsterBook_Update(uint8_t* pBytes) {
     // hook itself. (g_nLastHitX/Y came from the CUIWnd::HitTest capture.)
     const bool nowDown = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
     if (g_bLeftBtnDown && !nowDown) {
-        // Falling edge — left mouse just released. Translate cached wnd-
-        // local cursor pos to LAYER[0]-local; check tab strip first then
-        // cells. LAYER[0] sits at wnd offset (40, 25) per CreateLayer
-        // kLayers[0].
+        // Falling edge — left mouse just released. Layer-local hit-test
+        // priority: LP strip (left edge) → RP strip (right edge) → top
+        // indicator strip on LAYER[0] → cell on LAYER[0]. KMST routes
+        // through CCtrlLPTab/CCtrlRPTab vtable dispatch; we do flat
+        // hit-tests against the per-strip rects built by
+        // MonsterBook_DrawTabStrip on the last paint.
         if (g_nLastHitX >= 0 && g_nLastHitY >= 0) {
+            const POINT ptLP = { g_nLastHitX - (-7), g_nLastHitY - 25 };
+            const POINT ptRP = { g_nLastHitX - 439,  g_nLastHitY - 25 };
             const int32_t rxL0 = g_nLastHitX - 40;
             const int32_t ryL0 = g_nLastHitY - 25;
 
-            // Tab indicator strip click → switch m_nCurrentTab.
-            const int32_t tabHit = MonsterBook_TabStripHitTest(rxL0, ryL0);
-            if (tabHit >= 0) {
+            int32_t lpHit = -1;
+            for (int t = 0; t < 9; ++t) {
+                if (::PtInRect(&g_aLPTabRects[t], ptLP)) {
+                    lpHit = t;
+                    break;
+                }
+            }
+            int32_t rpHit = -1;
+            for (int t = 0; t < 4; ++t) {
+                if (::PtInRect(&g_aRPTabRects[t], ptRP)) {
+                    rpHit = t;
+                    break;
+                }
+            }
+
+            if (lpHit >= 0) {
                 auto* pLPTab = *reinterpret_cast<CCtrlLPTab**>(pBytes + 0x1564);
-                if (pLPTab && pLPTab->m_nCurrentTab != tabHit) {
-                    DEBUG_MESSAGE("MonsterBook_Update: tab click @wnd(%d,%d) "
-                                  "-> tab %d (was %d)",
-                                  g_nLastHitX, g_nLastHitY,
-                                  tabHit, pLPTab->m_nCurrentTab);
-                    pLPTab->m_nCurrentTab = tabHit;
-                    // New tab — different card pool, reset paging + selection.
+                if (pLPTab && pLPTab->m_nCurrentTab != lpHit) {
+                    DEBUG_MESSAGE("MonsterBook_Update: LP click -> tab %d (was %d)",
+                                  lpHit, pLPTab->m_nCurrentTab);
+                    pLPTab->m_nCurrentTab = lpHit;
                     g_nLeftPage     = 0;
                     g_nSelectedCard = 0;
-                    *reinterpret_cast<int32_t*>(pBytes + 0x15A0) = 1;
-                    *reinterpret_cast<int32_t*>(pBytes + 0x15B0) = 1;
+                    *reinterpret_cast<int32_t*>(pBytes + 0x15A0) = 1; // L0 grid
+                    *reinterpret_cast<int32_t*>(pBytes + 0x15A8) = 1; // L1 detail
+                    *reinterpret_cast<int32_t*>(pBytes + 0x15B0) = 1; // L2 cursor
+                    g_dirtyLP = 1;                                    // LP strip
+                }
+            } else if (rpHit >= 0) {
+                auto* pRPTab = *reinterpret_cast<CCtrlRPTab**>(pBytes + 0x156C);
+                if (pRPTab && pRPTab->m_nCurrentTab != rpHit) {
+                    DEBUG_MESSAGE("MonsterBook_Update: RP click -> tab %d (was %d)",
+                                  rpHit, pRPTab->m_nCurrentTab);
+                    pRPTab->m_nCurrentTab = rpHit;
+                    g_nRightPage = 0;
+                    *reinterpret_cast<int32_t*>(pBytes + 0x15A8) = 1; // L1 detail
+                    g_dirtyRP = 1;                                    // RP strip
                 }
             } else {
-                // Cell click → update selected card index.
-                const int32_t cellHit = MonsterBook_CellHitTest(pBytes, rxL0, ryL0);
-                if (cellHit >= 0 && cellHit != g_nSelectedCard) {
-                    DEBUG_MESSAGE("MonsterBook_Update: click @wnd(%d,%d) -> "
-                                  "L0(%d,%d) -> cell %d (was %d)",
-                                  g_nLastHitX, g_nLastHitY, rxL0, ryL0,
-                                  cellHit, g_nSelectedCard);
-                    g_nSelectedCard = cellHit;
-                    // Cursor overlay (LAYER[2]) and detail panel (LAYER[1]
-                    // — stub for now, real body in a follow-up) both
-                    // depend on selection state.
-                    *reinterpret_cast<int32_t*>(pBytes + 0x15A8) = 1;
-                    *reinterpret_cast<int32_t*>(pBytes + 0x15B0) = 1;
+                // Top tab indicator strip on LAYER[0] (kept as a redundant
+                // input path — visible bar at the top of the card grid).
+                const int32_t tabHit = MonsterBook_TabStripHitTest(rxL0, ryL0);
+                if (tabHit >= 0) {
+                    auto* pLPTab = *reinterpret_cast<CCtrlLPTab**>(pBytes + 0x1564);
+                    if (pLPTab && pLPTab->m_nCurrentTab != tabHit) {
+                        DEBUG_MESSAGE("MonsterBook_Update: top-strip click -> tab %d",
+                                      tabHit);
+                        pLPTab->m_nCurrentTab = tabHit;
+                        g_nLeftPage     = 0;
+                        g_nSelectedCard = 0;
+                        *reinterpret_cast<int32_t*>(pBytes + 0x15A0) = 1;
+                        *reinterpret_cast<int32_t*>(pBytes + 0x15A8) = 1;
+                        *reinterpret_cast<int32_t*>(pBytes + 0x15B0) = 1;
+                        g_dirtyLP = 1;
+                    }
+                } else {
+                    // Cell click → update selected card index.
+                    const int32_t cellHit = MonsterBook_CellHitTest(pBytes, rxL0, ryL0);
+                    if (cellHit >= 0 && cellHit != g_nSelectedCard) {
+                        DEBUG_MESSAGE("MonsterBook_Update: cell click -> %d (was %d)",
+                                      cellHit, g_nSelectedCard);
+                        g_nSelectedCard = cellHit;
+                        // Cursor overlay (LAYER[2]) and detail panel (LAYER[1])
+                        // both depend on selection state.
+                        *reinterpret_cast<int32_t*>(pBytes + 0x15A8) = 1;
+                        *reinterpret_cast<int32_t*>(pBytes + 0x15B0) = 1;
+                    }
                 }
             }
         }
@@ -1616,6 +2165,19 @@ static void MonsterBook_Update(uint8_t* pBytes) {
             MonsterBook_DrawLayer(pBytes, i);
             *pFlag = 0;
         }
+    }
+
+    // LP / RP strip dirty flags live in module-scope statics rather than
+    // pBytes offsets (see MonsterBook_CreateExtraLayers rationale).
+    if (g_dirtyLP) {
+        DEBUG_MESSAGE("MonsterBook_Update: LP strip dirty — paint");
+        MonsterBook_DrawLPLayer(pBytes);
+        g_dirtyLP = 0;
+    }
+    if (g_dirtyRP) {
+        DEBUG_MESSAGE("MonsterBook_Update: RP strip dirty — paint");
+        MonsterBook_DrawRPLayer(pBytes);
+        g_dirtyRP = 0;
     }
 }
 
@@ -1756,37 +2318,84 @@ void CCtrlTab::CreateCtrlFromRect(CWnd* pParent, uint32_t nId,
                   m_pSubLayer, m_pCanvas);
 }
 
-// KMST 0x008469C0 (~370 lines, tools/decomp/cache_kmst/008469c0.c).
-// CCtrlLPTab::CreateCtrl iterates the WZ tree at
-// `UI/UIWindow.img/MonsterBook/MainTab/...` and builds a list of
-// CCtrlTab::Info structs.
+// Helper used by both LP/RP CreateCtrlFromRect to load one tab's
+// {normal, selected} canvas pair from the v95 WZ. KMST's full body iterates
+// the LP/RP subtree, builds CCtrlTab::Info entries, and AddTails them into a
+// ZList — we shortcut that by writing canvases directly into the module-
+// scope g_lpTabIcons / g_rpTabIcons arrays.
 //
-// Originally this called CCtrlTab::CreateCtrlFromRect which in turn called
-// CCtrlWnd::CreateCtrl to register LPTab as a child wnd of the parent. That
-// caused crashes when v95's input system dispatched click events through
-// the LPTab — our compiler-generated kinoko C++ vtable for CCtrlLPTab does
-// NOT match v95's expected layout, so OnChildNotify's vtable[8] dispatch
-// (which v95 expects to land on OnButtonClicked) lands inside an unrelated
-// v95 function (CInputSystem::TryAcquireDevice +0x1F9), eventually faulting
-// at garbage memory.
-//
-// Skip the registration entirely. LPTab still exists as a heap object so
-// DrawLeftLayer can read m_nCurrentTab from offset +0x34 (= 0). The visual
-// tab strip on the left is invisible (was already invisible because we
-// skipped the WZ tab tree iteration) and click events on the strip area no
-// longer dispatch through it.
-void CCtrlLPTab::CreateCtrlFromRect(CWnd* pParent, uint32_t nId,
-                                    const RECT* pRect, void* pParam) {
-    DEBUG_MESSAGE("CCtrlLPTab::CreateCtrlFromRect: data-only (no wnd registration)");
-    m_nCurrentTab = 0;
+// Path patterns (verified via wz_search on the v95 WZ):
+//   UI/UIWindow.img/MonsterBook/LeftTab/<idx>/{normal,selected}/0  (9 tabs)
+//   UI/UIWindow.img/MonsterBook/RightTab/<idx>/{normal,selected}/0 (4 tabs)
+// LeftTab nodes also expose mouseOver, new_n, new_s — skipped here for
+// scope; "normal" + "selected" cover the two visible states a v95 player
+// will see.
+static void MonsterBook_LoadTabIconPair(const wchar_t* sStripName,
+                                        int32_t tabIdx,
+                                        IWzCanvasPtr& outNormal,
+                                        IWzCanvasPtr& outSelected) {
+    static const wchar_t* kSubKeys[2] = { L"normal", L"selected" };
+    IWzCanvasPtr* aOut[2] = { &outNormal, &outSelected };
+    for (int s = 0; s < 2; ++s) {
+        try {
+            wchar_t sPath[160];
+            swprintf_s(sPath, 160,
+                       L"UI/UIWindow.img/MonsterBook/%s/%d/%s/0",
+                       sStripName, tabIdx, kSubKeys[s]);
+            *aOut[s] = get_unknown(get_rm()->GetObjectA(Ztl_bstr_t(sPath)));
+        } catch (const _com_error& e) {
+            DEBUG_MESSAGE("  tab-icon load %S/%d/%S threw 0x%08X (%s)",
+                          sStripName, tabIdx, kSubKeys[s],
+                          static_cast<unsigned>(e.Error()), e.ErrorMessage());
+        }
+    }
 }
 
-// KMST 0x008476ED (~290 lines). Same data-only port as LPTab: don't register
-// as child wnd; just keep m_nCurrentTab=0 readable from the slot.
+// KMST 0x008469C0 (~370 lines, tools/decomp/cache_kmst/008469c0.c).
+// CCtrlLPTab::CreateCtrl iterates the WZ subtree at
+// UI/UIWindow.img/MonsterBook/LeftTab and builds a CCtrlTab::Info struct per
+// area tab + a separate Info for the cover/special tab. The full port would
+// require porting CCtrlTab::Info (~0x70 bytes per entry) + ZList<ZRef<Info>>
+// + 9 hand-built vtables — see the deferred-rationale block in
+// project_ghidra_kmst.md.
+//
+// Pragmatic substitute: load the per-tab {normal, selected} canvases into
+// module-scope g_lpTabIcons[9][2] and let MonsterBook_DrawLPLayer paint the
+// strip directly. Visible payoff matches what KMST shows in-game; full
+// CCtrlTab::Info support is only needed if the new_n/new_s "new card"
+// badges become a priority.
+//
+// Skip the v95 wnd-registration path: kinoko's compiler-generated CCtrlWnd
+// vtable doesn't match v95's expected slot layout, so dispatching v95 input
+// events through this object would crash (see
+// feedback_kinoko_cppvtable_no_v95_register). LPTab stays as a data-only
+// object accessed via typed C++ pointers.
+void CCtrlLPTab::CreateCtrlFromRect(CWnd* pParent, uint32_t nId,
+                                    const RECT* pRect, void* pParam) {
+    DEBUG_MESSAGE("CCtrlLPTab::CreateCtrlFromRect: load 9 LeftTab WZ pairs");
+    m_nCurrentTab = 0;
+    for (int t = 0; t < 9; ++t) {
+        MonsterBook_LoadTabIconPair(L"LeftTab", t,
+                                    g_lpTabIcons[t][0],
+                                    g_lpTabIcons[t][1]);
+    }
+}
+
+// KMST 0x008476ED (~290 lines). Same approach as LPTab — load per-tab
+// {normal, selected} canvases from RightTab/<idx> for the 4 right-side
+// region tabs, paint via MonsterBook_DrawRPLayer. RightTab nodes expose
+// disabled state too (real v95 RP tabs grey out when the player's book
+// level is too low) — skipped here; book-level gating is server-side and
+// not yet wired into the UI.
 void CCtrlRPTab::CreateCtrlFromRect(CWnd* pParent, uint32_t nId,
                                     const RECT* pRect, void* pParam) {
-    DEBUG_MESSAGE("CCtrlRPTab::CreateCtrlFromRect: data-only (no wnd registration)");
+    DEBUG_MESSAGE("CCtrlRPTab::CreateCtrlFromRect: load 4 RightTab WZ pairs");
     m_nCurrentTab = 0;
+    for (int t = 0; t < 4; ++t) {
+        MonsterBook_LoadTabIconPair(L"RightTab", t,
+                                    g_rpTabIcons[t][0],
+                                    g_rpTabIcons[t][1]);
+    }
 }
 
 
@@ -1871,7 +2480,11 @@ static void MonsterBook_OnButtonClicked(uint8_t* pBytes, uint32_t nId) {
             0x004842C0)(pEdit, &sText);
         const char* pszQuery = static_cast<const char*>(sText);
         if (!pszQuery || !*pszQuery) {
-            DEBUG_MESSAGE("  search query empty — no-op");
+            DEBUG_MESSAGE("  search query empty — clear results + no-op");
+            g_searchMatches.clear();
+            g_searchIndex = 0;
+            g_searchQueryActive.clear();
+            MonsterBook_MarkLayerDirty(pBytes, 0x15A8);
             return;
         }
 
@@ -1882,50 +2495,74 @@ static void MonsterBook_OnButtonClicked(uint8_t* pBytes, uint32_t nId) {
                            return static_cast<char>(::tolower(c));
                        });
 
-        DEBUG_MESSAGE("  search query=\"%s\"", query.c_str());
-
-        // Walk all 9 tabs; first card whose mob-name contains the query
-        // wins. KMST's CMonsterBookMan::SearchCard would prefer the
-        // current tab + tab order; we keep it simple — left-to-right tab
-        // walk, lowest cell index first.
-        auto* pCardTableArrays =
-            reinterpret_cast<ZArray<V95Ref>*>(pBytes + 0x1888);
-        for (int tab = 0; tab < 9; ++tab) {
-            auto& tabCards = pCardTableArrays[tab];
-            const uint32_t cnt = tabCards.GetCount();
-            for (uint32_t i = 0; i < cnt; ++i) {
-                auto& v95Ref = tabCards[i];
-                if (!v95Ref.p) continue;
-                const int32_t cardId = *reinterpret_cast<int32_t*>(v95Ref.p);
-                const int32_t mobId  = MonsterBook_ResolveMobId(cardId);
-                const std::string& name = MonsterBook_LookupMobName(mobId);
-                if (name.empty()) continue;
-                std::string nameLower(name);
-                std::transform(nameLower.begin(), nameLower.end(),
-                               nameLower.begin(),
-                               [](unsigned char c) {
-                                   return static_cast<char>(::tolower(c));
-                               });
-                if (nameLower.find(query) == std::string::npos) continue;
-
-                // Hit. Jump to that card.
-                auto* pLPTab = *reinterpret_cast<CCtrlLPTab**>(pBytes + 0x1564);
-                if (pLPTab) {
-                    pLPTab->m_nCurrentTab = tab;
+        // Re-clicking with the same query advances to the next match
+        // instead of re-running the walk. Empty match list → stay put
+        // (the count display on LAYER[1] still reads "0 / 0").
+        if (query == g_searchQueryActive && !g_searchMatches.empty()) {
+            g_searchIndex = (g_searchIndex + 1) % g_searchMatches.size();
+            DEBUG_MESSAGE("  search advance: query=\"%s\" idx=%u/%u",
+                          query.c_str(),
+                          static_cast<unsigned>(g_searchIndex),
+                          static_cast<unsigned>(g_searchMatches.size()));
+        } else {
+            // New query — collect ALL matches across all tabs.
+            g_searchMatches.clear();
+            g_searchIndex = 0;
+            g_searchQueryActive = query;
+            auto* pCardTableArrays =
+                reinterpret_cast<ZArray<V95Ref>*>(pBytes + 0x1888);
+            for (int tab = 0; tab < 9; ++tab) {
+                auto& tabCards = pCardTableArrays[tab];
+                const uint32_t cnt = tabCards.GetCount();
+                for (uint32_t i = 0; i < cnt; ++i) {
+                    auto& v95Ref = tabCards[i];
+                    if (!v95Ref.p) continue;
+                    const int32_t cardId = *reinterpret_cast<int32_t*>(v95Ref.p);
+                    const int32_t mobId  = MonsterBook_ResolveMobId(cardId);
+                    const std::string& name = MonsterBook_LookupMobName(mobId);
+                    if (name.empty()) continue;
+                    std::string nameLower(name);
+                    std::transform(nameLower.begin(), nameLower.end(),
+                                   nameLower.begin(),
+                                   [](unsigned char c) {
+                                       return static_cast<char>(::tolower(c));
+                                   });
+                    if (nameLower.find(query) == std::string::npos) continue;
+                    g_searchMatches.push_back({
+                        tab,
+                        static_cast<int32_t>(i / 25),
+                        static_cast<int32_t>(i % 25),
+                    });
                 }
-                g_nLeftPage     = static_cast<int32_t>(i / 25);
-                g_nSelectedCard = static_cast<int32_t>(i % 25);
-                DEBUG_MESSAGE("  match: \"%s\" (mob=%d card=%d) -> "
-                              "tab=%d page=%d sel=%d",
-                              name.c_str(), mobId, cardId,
-                              tab, g_nLeftPage, g_nSelectedCard);
-                MonsterBook_MarkLayerDirty(pBytes, 0x15A0);  // L0 grid
-                MonsterBook_MarkLayerDirty(pBytes, 0x15A8);  // L1 detail
-                MonsterBook_MarkLayerDirty(pBytes, 0x15B0);  // L2 cursor
-                return;
             }
+            DEBUG_MESSAGE("  search collect: query=\"%s\" total=%u matches",
+                          query.c_str(),
+                          static_cast<unsigned>(g_searchMatches.size()));
         }
-        DEBUG_MESSAGE("  search: no match for \"%s\"", query.c_str());
+
+        if (g_searchMatches.empty()) {
+            DEBUG_MESSAGE("  search: no match for \"%s\"", query.c_str());
+            // Still dirty LAYER[1] so the "0 / 0" count renders.
+            MonsterBook_MarkLayerDirty(pBytes, 0x15A8);
+            return;
+        }
+
+        // Jump to the active match.
+        const SearchHit& hit = g_searchMatches[g_searchIndex];
+        auto* pLPTab = *reinterpret_cast<CCtrlLPTab**>(pBytes + 0x1564);
+        if (pLPTab) {
+            pLPTab->m_nCurrentTab = hit.tab;
+        }
+        g_nLeftPage     = hit.page;
+        g_nSelectedCard = hit.cell;
+        DEBUG_MESSAGE("  match[%u/%u]: tab=%d page=%d sel=%d",
+                      static_cast<unsigned>(g_searchIndex + 1),
+                      static_cast<unsigned>(g_searchMatches.size()),
+                      hit.tab, hit.page, hit.cell);
+        MonsterBook_MarkLayerDirty(pBytes, 0x15A0);  // L0 grid
+        MonsterBook_MarkLayerDirty(pBytes, 0x15A8);  // L1 detail + count
+        MonsterBook_MarkLayerDirty(pBytes, 0x15B0);  // L2 cursor
+        g_dirtyLP = 1;                                // LP strip (tab change)
         return;
     }
     case 0x07D1: {
