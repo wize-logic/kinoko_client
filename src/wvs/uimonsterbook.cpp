@@ -65,14 +65,17 @@ constexpr uintptr_t kDAT_MonsterBookGlobal                = 0x00C6F010;
 // itself, so vtable-dispatched calls into 0x009AE7C0 are also caught.)
 constexpr uintptr_t kCWnd_Update                          = 0x009AE7C0;
 
-// CUIWnd::OnButtonClicked at 0x008DD520. Earlier guess was the CWnd base
-// no-op at 0x00429280, but v95 CUIWnd OVERRIDES — its vtable slot 8 routes
-// id=1000 to CWvsContext::UI_Close (so the close X works) and no-ops every
-// other id. v95 CUIWnd::CUIWnd stamps THIS vtable into our buffer, so all
-// our nav-button clicks land here. Filter on `pThis == g_pV95MonsterBookGlobal`
-// inside the hook; the original tail-call still runs after our handler so
-// id=1000 closing keeps working unchanged.
-constexpr uintptr_t kCUIWnd_OnButtonClicked               = 0x008DD520;
+// CWnd::OnChildNotify at 0x00429260. The dispatch site for button clicks —
+// CCtrlButton::MouseUp calls vtable[7] of m_pParent with (id, 100, 0).
+// CWnd's slot 7 does `if msg==100: vtable[8](id)` — that vtable[8] route
+// to v95's CUIWnd::OnButtonClicked (which handles close/id=1000 by tail-
+// jumping to UI_Close). Hooking *here* lets us intercept clicks BEFORE the
+// CUIWnd dispatch runs while leaving the close path itself untouched —
+// earlier attempt to hook CUIWnd::OnButtonClicked itself crashed via a
+// Detours trampoline-placement issue (the trampoline pointer landed inside
+// CMemoryGameDlg::IsWinnerLastTime at 0x006275C0). OnChildNotify is a
+// cleaner upstream cut.
+constexpr uintptr_t kCWnd_OnChildNotify                   = 0x00429260;
 
 
 // === Mod-side state =========================================================
@@ -847,19 +850,39 @@ namespace {
     std::unordered_map<int32_t, int32_t> g_cardToMob;
     std::unordered_map<int32_t, IWzCanvasPtr> g_mobIcon;
 
-    // First-call diagnostic probe: log whether each candidate path resolves
-    // for the FIRST cardId we resolve. Sticky bool guards re-probing.
+    // First-call diagnostic probe. Two passes:
+    //   1) Dump v95 StringPool[0xF20] — that's the literal WZ path string
+    //      that CMonsterBookMan::LoadCard (0x006634b0) walks. Once we know
+    //      it, the resolver can use the same prefix.
+    //   2) Best-effort guess probes against the still-loaded ResMan tree.
     bool g_probedWzRoot = false;
     void MonsterBook_ProbeWzPaths(int32_t cardId) {
         if (g_probedWzRoot) return;
         g_probedWzRoot = true;
 
+        // ZXString<wchar_t> wire shape: a single 4-byte pointer to a refcount/
+        // length header. We only read the inner wchar_t* for logging; release
+        // is handled by the temporary's static dtor when the function returns.
+        struct ZXStringW { wchar_t* p; };
+        ZXStringW path0xF20 = { nullptr };
+        try {
+            void* pPool = reinterpret_cast<void*(__cdecl*)()>(0x007466A0)();
+            reinterpret_cast<ZXStringW*(__thiscall*)(void*, ZXStringW*, uint32_t)>(
+                0x00403B60)(pPool, &path0xF20, 0xF20);
+            DEBUG_MESSAGE("  v95 StringPool[0xF20] = %S",
+                          path0xF20.p ? path0xF20.p : L"<null>");
+        } catch (const _com_error& e) {
+            DEBUG_MESSAGE("  StringPool[0xF20] probe threw 0x%08X (%s)",
+                          static_cast<unsigned>(e.Error()), e.ErrorMessage());
+        }
+
         const wchar_t* kProbes[] = {
             L"Etc/MonsterBook.img",
-            L"Etc.wz/MonsterBook.img",
-            L"MonsterBook.img",
-            L"Etc",
-            L"Etc/MonsterBook",
+            L"Etc/MonsterBook.list",
+            L"Etc/MonsterBookSet.img",
+            L"Etc/Monster.img",
+            L"Quest/MonsterBook.img",
+            L"String/MonsterBook.img",
         };
         for (const wchar_t* p : kProbes) {
             try {
@@ -867,28 +890,8 @@ namespace {
                 DEBUG_MESSAGE("  WZprobe[%S] -> vt=%u",
                               p, static_cast<unsigned>(V_VT(&v)));
             } catch (const _com_error& e) {
-                DEBUG_MESSAGE("  WZprobe[%S] FAIL 0x%08X (%s)",
-                              p, static_cast<unsigned>(e.Error()),
-                              e.ErrorMessage());
-            }
-        }
-
-        // Also probe the cardId leaf under each candidate.img to check whether
-        // the .img exists but the cardId child is the missing piece.
-        wchar_t sPath[80];
-        const wchar_t* kCardLeafs[] = {
-            L"Etc/MonsterBook.img/%d",
-            L"Etc/MonsterBook.img/0%07d",
-        };
-        for (const wchar_t* fmt : kCardLeafs) {
-            swprintf_s(sPath, 80, fmt, cardId);
-            try {
-                Ztl_variant_t v = get_rm()->GetObjectA(Ztl_bstr_t(sPath));
-                DEBUG_MESSAGE("  WZprobe[%S] -> vt=%u",
-                              sPath, static_cast<unsigned>(V_VT(&v)));
-            } catch (const _com_error& e) {
                 DEBUG_MESSAGE("  WZprobe[%S] FAIL 0x%08X",
-                              sPath, static_cast<unsigned>(e.Error()));
+                              p, static_cast<unsigned>(e.Error()));
             }
         }
     }
@@ -1645,18 +1648,19 @@ static void MonsterBook_OnButtonClicked(uint8_t* pBytes, uint32_t nId) {
 static auto CWvsContext__UI_Open = kCWvsContext_UI_Open;
 static auto CWvsContext__UI_Close = kCWvsContext_UI_Close;
 static auto CWnd__Update = kCWnd_Update;
-static auto CUIWnd__OnButtonClicked = kCUIWnd_OnButtonClicked;
+static auto CWnd__OnChildNotify = kCWnd_OnChildNotify;
 
-void __fastcall CUIWnd__OnButtonClicked_hook(void* pThis, void* /*EDX*/, uint32_t nId) {
-    // Detoured over CUIWnd::OnButtonClicked. Filter on our wnd; let every
-    // other CUIWnd subclass pass through unchanged. Original handles id=1000
-    // close (tail-calls CWvsContext::UI_Close) and no-ops every other id, so
-    // running our handler first then chaining is safe for both branches.
-    if (pThis != nullptr && pThis == g_pV95MonsterBookGlobal) {
+void __fastcall CWnd__OnChildNotify_hook(void* pThis, void* /*EDX*/,
+                                          uint32_t nId, uint32_t nMsg,
+                                          int32_t nLParam) {
+    // Detoured over CWnd::OnChildNotify. msg==100 means a button click;
+    // for our wnd, run our handler before chaining to the original (which
+    // dispatches via vtable[8] = CUIWnd::OnButtonClicked → close path).
+    if (pThis != nullptr && pThis == g_pV95MonsterBookGlobal && nMsg == 100) {
         MonsterBook_OnButtonClicked(static_cast<uint8_t*>(pThis), nId);
     }
-    reinterpret_cast<void(__thiscall*)(void*, uint32_t)>(CUIWnd__OnButtonClicked)(
-        pThis, nId);
+    reinterpret_cast<void(__thiscall*)(void*, uint32_t, uint32_t, int32_t)>(
+        CWnd__OnChildNotify)(pThis, nId, nMsg, nLParam);
 }
 
 void __fastcall CWnd__Update_hook(void* pThis, void* /*EDX*/) {
@@ -1758,8 +1762,10 @@ void AttachUIMonsterBook() {
     ATTACH_HOOK(CWvsContext__UI_Close, CWvsContext__UI_Close_hook);
     // Hooks every CWnd::Update — filtered to our wnd inside the detour.
     ATTACH_HOOK(CWnd__Update, CWnd__Update_hook);
-    // Hooks CUIWnd::OnButtonClicked — filtered to our wnd inside the detour.
-    // Other CUIWnd subclasses pass through to the original (which handles
-    // id=1000 close and no-ops every other id, so chaining is safe).
-    ATTACH_HOOK(CUIWnd__OnButtonClicked, CUIWnd__OnButtonClicked_hook);
+    // Hooks CWnd::OnChildNotify — fires for every button-click dispatch
+    // across the entire UI; filter (pThis == ours, msg==100) inside.
+    // Chosen over CUIWnd::OnButtonClicked because Detours-trampolining the
+    // latter placed the trampoline pointer inside an unrelated function
+    // (CMemoryGameDlg::IsWinnerLastTime) → crashed on first close click.
+    ATTACH_HOOK(CWnd__OnChildNotify, CWnd__OnChildNotify_hook);
 }
