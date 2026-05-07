@@ -1353,19 +1353,28 @@ static void MonsterBook_DrawRightLayer(uint8_t* pBytes) {
     // upper half. PcCreateObject(L"Canvas") is the MapleStory-internal
     // class factory — `CreateInstance` would hit COM and fail since
     // L"Canvas" isn't registered with the OS COM runtime.
+    //
+    // CopyEx signature (IWzCanvas.idl): (nDstLeft, nDstTop, pSource, nAlpha,
+    // nWidth, nHeight, nSrcLeft, nSrcTop, nSrcWidth, nSrcHeight, [opt]).
+    // We read the icon's actual width/height via the IWzCanvas propgets so
+    // the source rect matches the loaded canvas exactly.
     IWzCanvasPtr pIcon = MonsterBook_LoadCardIcon(cardId);
     if (pIcon) {
         try {
             constexpr int kZoom = 3;
-            constexpr int kScaledW = 33 * kZoom;
-            constexpr int kScaledH = 33 * kZoom;
+            const int srcW = static_cast<int>(pIcon->width);
+            const int srcH = static_cast<int>(pIcon->height);
+            const int kScaledW = srcW * kZoom;
+            const int kScaledH = srcH * kZoom;
             IWzCanvasPtr pZoom;
             PcCreateObject<IWzCanvasPtr>(L"Canvas", pZoom, nullptr);
-            if (pZoom) {
+            if (pZoom && srcW > 0 && srcH > 0) {
                 pZoom->Create(kScaledW, kScaledH);
                 pZoom->cx = 0;
                 pZoom->cy = 0;
-                pZoom->CopyEx(0, 0, kScaledW, kScaledH, pIcon);
+                pZoom->CopyEx(0, 0, pIcon, CA_OVERWRITE,
+                              kScaledW, kScaledH,
+                              0, 0, srcW, srcH);
                 const int dstX = (static_cast<int>(kPanelW) - kScaledW) / 2;
                 const int dstY = 8;
                 pCanvas->Copy(dstX, dstY, pZoom);
