@@ -659,12 +659,16 @@ static void MonsterBook_CreateFontArray(void* pThis) {
     //   _com_ptr_t<IWzFont>* __cdecl get_basic_font(_com_ptr_t<IWzFont>* out, FONT_TYPE);
     // (The ABI returns the out-buffer pointer for chaining; the IWzFont smart
     // pointer is constructed in-place at the out-buffer.)
+    //
+    // Use std::addressof rather than `&basic1` because _com_ptr_t overloads
+    // operator& to return the inner raw `IWzFont**`, which is binary-
+    // equivalent but type-mismatches our IWzFontPtr* signature.
     using GetBasicFontFn = IWzFontPtr*(__cdecl*)(IWzFontPtr*, int32_t);
     static auto get_basic_font = reinterpret_cast<GetBasicFontFn>(0x0095F9D0);
 
     IWzFontPtr basic1, basic43;
-    get_basic_font(&basic1, 1);
-    get_basic_font(&basic43, 0x43);
+    get_basic_font(std::addressof(basic1), 1);
+    get_basic_font(std::addressof(basic43), 0x43);
     (*pFontArray)[0] = basic1;
     (*pFontArray)[1] = basic43;
     DEBUG_MESSAGE("  Slots 0/1 populated via get_basic_font(1)/get_basic_font(0x43)");
