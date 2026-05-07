@@ -100,6 +100,12 @@ namespace {
     // correct. Reset on UI_Open via MonsterBook_ResetPageState().
     int32_t g_nLeftPage  = 0;
     int32_t g_nRightPage = 0;
+
+    // Currently-selected card slot index on the left page (0..24). KMST
+    // stores at +0x7C0 (= v95 +0xE60). DrawSelectLayer composites the cursor
+    // overlay at m_aRect[g_nSelectedCard]. Click/key handlers updating this
+    // value are deferred — for now defaults to 0 (top-left cell highlighted).
+    int32_t g_nSelectedCard = 0;
 }
 
 
@@ -1156,16 +1162,105 @@ static void MonsterBook_DrawRightLayer(uint8_t* pBytes) {
                    /*color (ARGB)=*/0xC0A040A0, "L1");
 }
 
-// KMST 0x0084B3A0 (276 lines, DEFERRED). Real body composites the cover-
-// card image + selection cursor onto LAYER[2]. Needs +0x1564 right-tab state
-// (we don't populate it), CUserLocal::GetMonsterBookCover (no v95 symbol),
-// and `UI/UIWindow.img/MonsterBook/...` cursor paths from StringPool keys.
-// Stub: translucent yellow so the LAYER[2] overlay is visible above LAYER[0].
+// KMST 0x0084B3A0 (276 lines). Renders LAYER[2] — the selection cursor
+// + cover-card highlight overlays.
+//
+// KMST flow:
+//   1. Allocate a working canvas via PcCreateObject(L"Canvas") and Create.
+//   2. If currentTab != 9 (the special-summary tab):
+//        a. coverCardId = CUserLocal::GetMonsterBookCover()
+//        b. If cover != 0: GetCard(cover); if cover->tab == currentTab AND
+//           cover->idx / 25 == m_nLeftPage, composite a "cover" overlay
+//           onto the working canvas at m_aRect[cover->idx % 25].
+//        c. Composite a "select" cursor onto the working canvas at
+//           m_aRect[m_nSelected] (= +0x7C0).
+//   3. Composite the working canvas onto LAYER[2]'s canvas at (0, 0).
+//
+// v95 port scope: just the select cursor. Cover overlay needs
+// CUserLocal::GetMonsterBookCover (no v95 symbol surviving) plus a
+// CMonsterBookMan::GetCard(cardId) lookup that returns a struct whose
+// tab/idx fields v95 stripped — deferred.
+//
+// WZ paths recovered from KMST's auto-named string `u_UI_UIWindow_img_Mons`
+// truncation: candidates in .rdata are `cover`, `select`, `fullMark`. KMST
+// references the same auto-name three times across DrawLeftLayer + Draw-
+// SelectLayer, so each call site loads a *different* string starting with
+// the shared "UI/UIWindow.img/Mons..." prefix. For DrawSelectLayer's select
+// cursor we use `UI/UIWindow.img/MonsterBook/select`. Verified in KMST
+// strings dump: that path exists.
+//
+// m_aRect at v95 +0x15B8 holds 25 + 20 RECT structs (16 bytes each). The
+// first 25 are the per-cell hit zones for the left card grid — exactly
+// what we need to position the cursor.
 static void MonsterBook_DrawSelectLayer(uint8_t* pBytes) {
-    DEBUG_MESSAGE("MonsterBook_DrawSelectLayer: stub fill");
-    PaintLayerStub(pBytes, /*slotOffset=*/0x15B4,
-                   /*width=*/0xAE, /*height=*/0x100,
-                   /*color (ARGB)=*/0xA0FFE040, "L2");
+    auto* pLayer = *reinterpret_cast<IWzGr2DLayer**>(pBytes + 0x15B4);
+    if (!pLayer) {
+        DEBUG_MESSAGE("MonsterBook_DrawSelectLayer: LAYER[2] is null");
+        return;
+    }
+
+    IWzCanvasPtr pCanvas;
+    try {
+        pCanvas = pLayer->canvas[vtEmpty];
+    } catch (const _com_error& e) {
+        DEBUG_MESSAGE("  pLayer->canvas threw 0x%08X (%s)",
+                      e.Error(), e.ErrorMessage());
+        return;
+    }
+    if (!pCanvas) {
+        DEBUG_MESSAGE("  LAYER[2] canvas is NULL");
+        return;
+    }
+
+    // Clear the cursor canvas so prior frames' selection at a different
+    // index doesn't ghost. ARGB 0 = fully transparent — LAYER[2] composites
+    // over LAYER[0] with alpha so transparent regions show the card grid
+    // beneath unobstructed.
+    try {
+        pCanvas->DrawRectangle(0, 0, 0xAE, 0x100, 0x00000000);
+    } catch (const _com_error&) { return; }
+
+    // Cache the "select" cursor canvas — single WZ load for the entire
+    // process lifetime. Function-local static: the strong COM ref persists
+    // across /book open/close cycles so re-opens skip the WZ probe. Released
+    // on DLL unload along with all other static IWzCanvasPtrs in this TU.
+    static IWzCanvasPtr s_pSelectCanvas;
+    if (!s_pSelectCanvas) {
+        try {
+            s_pSelectCanvas = get_unknown(get_rm()->GetObjectA(
+                Ztl_bstr_t(L"UI/UIWindow.img/MonsterBook/select")));
+            DEBUG_MESSAGE("  loaded select canvas -> 0x%08X",
+                          s_pSelectCanvas.GetInterfacePtr());
+        } catch (const _com_error& e) {
+            DEBUG_MESSAGE("  load /select threw 0x%08X (%s)",
+                          static_cast<unsigned>(e.Error()), e.ErrorMessage());
+        }
+    }
+    if (!s_pSelectCanvas) {
+        DEBUG_MESSAGE("  no select canvas — abort");
+        return;
+    }
+
+    // Clamp + read m_aRect[g_nSelectedCard]. m_aRect is a 25-entry array of
+    // 16-byte RECT structs at +0x15B8. KMST's offset arithmetic in the
+    // disasm: `local_20 + idx * 0x10 + 0xF18` = `&m_aRect[idx]`.
+    if (g_nSelectedCard < 0 || g_nSelectedCard >= 25) g_nSelectedCard = 0;
+    auto* pRect = reinterpret_cast<RECT*>(
+        pBytes + 0x15B8 + g_nSelectedCard * sizeof(RECT));
+
+    // KMST composites at (rect.left - 2, rect.top - 2) — 2-px inset so the
+    // cursor frame surrounds the cell rather than nesting inside it.
+    try {
+        pCanvas->Copy(pRect->left - 2, pRect->top - 2, s_pSelectCanvas);
+    } catch (const _com_error& e) {
+        DEBUG_MESSAGE("  Copy threw 0x%08X (%s)",
+                      static_cast<unsigned>(e.Error()), e.ErrorMessage());
+        return;
+    }
+
+    DEBUG_MESSAGE("  L2 painted: select cursor at idx=%d rect=(%ld,%ld,%ld,%ld)",
+                  g_nSelectedCard, pRect->left, pRect->top,
+                  pRect->right, pRect->bottom);
 }
 
 // KMST CUIMonsterBook::DrawLayer (0x0084CBE7) dispatcher. Verbatim port —
@@ -1407,8 +1502,9 @@ namespace {
     }
 
     void MonsterBook_ResetPageState() {
-        g_nLeftPage  = 0;
-        g_nRightPage = 0;
+        g_nLeftPage     = 0;
+        g_nRightPage    = 0;
+        g_nSelectedCard = 0;
     }
 }
 
