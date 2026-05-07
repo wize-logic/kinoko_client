@@ -1982,11 +1982,14 @@ static void MonsterBook_DrawTabStrip(IWzGr2DLayer*       pLayer,
 
     int32_t cursorY = 0;
     for (int t = 0; t < tabCount; ++t) {
-        const auto* pSrcArr = &pIcons[t * 2];
+        // Direct refs sidestep _com_ptr_t::operator&() (which returns the
+        // inner IWzCanvas** instead of the IWzCanvasPtr* one would expect).
         // Use selected canvas for the active tab, normal otherwise.
-        IWzCanvas* pSrc = (t == currentTab && pSrcArr[1])
-                        ? pSrcArr[1].GetInterfacePtr()
-                        : pSrcArr[0].GetInterfacePtr();
+        const IWzCanvasPtr& pNormal   = pIcons[t * 2];
+        const IWzCanvasPtr& pSelected = pIcons[t * 2 + 1];
+        IWzCanvas* pSrc = (t == currentTab && pSelected)
+                        ? pSelected.GetInterfacePtr()
+                        : pNormal.GetInterfacePtr();
         int32_t tabH = 28;          // fallback if WZ load failed
         int32_t tabW = canvasW - 4; // narrow margin
         if (pSrc) {
@@ -2019,12 +2022,16 @@ static void MonsterBook_DrawTabStrip(IWzGr2DLayer*       pLayer,
                   tag, tabCount, currentTab);
 }
 
-// LP strip — 9 area tabs along the wnd's left edge.
+// LP strip — 9 area tabs along the wnd's left edge. std::addressof bypasses
+// _com_ptr_t::operator&() (which would return IWzCanvas** instead of
+// IWzCanvasPtr*); the 2D array's row-major layout means the address of
+// element [0][0] also addresses the contiguous 18-element flat buffer.
 static void MonsterBook_DrawLPLayer(uint8_t* pBytes) {
     auto* pLPTab = *reinterpret_cast<CCtrlLPTab**>(pBytes + 0x1564);
     const int32_t currentTab = pLPTab ? pLPTab->m_nCurrentTab : 0;
     MonsterBook_DrawTabStrip(g_pLPLayer, 57, 280,
-                             &g_lpTabIcons[0][0], 9, currentTab,
+                             std::addressof(g_lpTabIcons[0][0]),
+                             9, currentTab,
                              g_aLPTabRects, "LP");
 }
 
@@ -2033,7 +2040,8 @@ static void MonsterBook_DrawRPLayer(uint8_t* pBytes) {
     auto* pRPTab = *reinterpret_cast<CCtrlRPTab**>(pBytes + 0x156C);
     const int32_t currentTab = pRPTab ? pRPTab->m_nCurrentTab : 0;
     MonsterBook_DrawTabStrip(g_pRPLayer, 67, 195,
-                             &g_rpTabIcons[0][0], 4, currentTab,
+                             std::addressof(g_rpTabIcons[0][0]),
+                             4, currentTab,
                              g_aRPTabRects, "RP");
 }
 
@@ -2335,7 +2343,14 @@ static void MonsterBook_LoadTabIconPair(const wchar_t* sStripName,
                                         IWzCanvasPtr& outNormal,
                                         IWzCanvasPtr& outSelected) {
     static const wchar_t* kSubKeys[2] = { L"normal", L"selected" };
-    IWzCanvasPtr* aOut[2] = { &outNormal, &outSelected };
+    // _com_ptr_t::operator&() returns the inner IWzCanvas** rather than the
+    // IWzCanvasPtr* one would expect — std::addressof bypasses the overload
+    // and returns the actual element address (same trap as the basic_font
+    // get_basic_font(&basic1, ...) bug fixed in commit 0a9c5a1).
+    IWzCanvasPtr* aOut[2] = {
+        std::addressof(outNormal),
+        std::addressof(outSelected),
+    };
     for (int s = 0; s < 2; ++s) {
         try {
             wchar_t sPath[160];
