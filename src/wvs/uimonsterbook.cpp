@@ -65,6 +65,15 @@ constexpr uintptr_t kDAT_MonsterBookGlobal                = 0x00C6F010;
 // itself, so vtable-dispatched calls into 0x009AE7C0 are also caught.)
 constexpr uintptr_t kCWnd_Update                          = 0x009AE7C0;
 
+// CWnd::OnButtonClicked — base no-op (`ret 4`) at 0x00429280. CCtrlButton::
+// MouseUp dispatches button clicks via the parent's vtable: slot 7
+// (OnChildNotify @ 0x00429260, dispatches msg=100 to slot 8) → slot 8
+// (OnButtonClicked). v95 stripped CUIMonsterBook's override, so our buffer's
+// vtable slot 8 inherits the CWnd no-op. We hook the no-op address with
+// Detours and filter on `pThis == g_pV95MonsterBookGlobal` so only our
+// window's button clicks route to MonsterBook_OnButtonClicked.
+constexpr uintptr_t kCWnd_OnButtonClicked                 = 0x00429280;
+
 
 // === Mod-side state =========================================================
 
@@ -82,6 +91,15 @@ namespace {
     // UI_Open's "already open" gate reads the slot directly so this is
     // just a friendly handle for the close-side log line.
     void* g_pMonsterBookUI = nullptr;
+
+    // Page state. KMST stores these as buffer-relative members at +0x7B8 /
+    // +0x7BC (= v95 +0xE58 / +0xE5C under the 0x6A0 CUIWnd-size shift). We
+    // hold them mod-side instead so we don't have to verify the offsets land
+    // in CUIMonsterBook subclass territory rather than v95 CUIWnd internals
+    // — there's only one open MonsterBook window at a time, so a static is
+    // correct. Reset on UI_Open via MonsterBook_ResetPageState().
+    int32_t g_nLeftPage  = 0;
+    int32_t g_nRightPage = 0;
 }
 
 
@@ -1016,12 +1034,12 @@ static void MonsterBook_DrawLeftLayer(uint8_t* pBytes) {
         return;
     }
 
-    // 5x5 card grid for the current tab's first 25 cards. Geometry mirrors
-    // KMST CreateRect 0x0084988E:
+    // 5x5 card grid for the current tab's cards on g_nLeftPage. Geometry
+    // mirrors KMST CreateRect 0x0084988E:
     //   per-cell origin: (i%5)*0x21 + 8, (i/5)*0x2D + 0x1F
     //   per-cell size:   (0x1B, 0x26)
     //
-    // Per populated cell we resolve cardId from m_aCardTable[currentTab][i].p
+    // Per populated cell we resolve cardId from m_aCardTable[currentTab][page*25+i].p
     // (MonsterBookCard*; cardId stored as `(short)(cardId - 0x50E0)` at +0,
     // count byte at +2 — verified via CMonsterBookAccessor::SetCount disasm),
     // then resolve cardId → mobId via Item.wz and Copy the loaded
@@ -1032,7 +1050,16 @@ static void MonsterBook_DrawLeftLayer(uint8_t* pBytes) {
     // restored at the end — we'll wire that in a follow-up once Windows
     // iteration confirms portraits load and the bleed becomes the next gap.
     constexpr int32_t kCellsPerPage = 25;
-    const uint32_t pageCount = std::min<uint32_t>(cardCount, kCellsPerPage);
+    const int32_t pageMax  = (cardCount == 0) ? 0
+                           : static_cast<int32_t>((cardCount - 1) / 25);
+    if (g_nLeftPage > pageMax) g_nLeftPage = pageMax;
+    if (g_nLeftPage < 0)       g_nLeftPage = 0;
+    const uint32_t pageOffset = static_cast<uint32_t>(g_nLeftPage) * kCellsPerPage;
+    const uint32_t pageCount  = (cardCount > pageOffset)
+                              ? std::min<uint32_t>(cardCount - pageOffset, kCellsPerPage)
+                              : 0;
+    DEBUG_MESSAGE("  page=%d/%d (offset=%u count=%u)",
+                  g_nLeftPage, pageMax, pageOffset, pageCount);
     for (int i = 0; i < kCellsPerPage; ++i) {
         const int32_t cellX = (i % 5) * 0x21 + 8;
         const int32_t cellY = (i / 5) * 0x2D + 0x1F;
@@ -1049,8 +1076,9 @@ static void MonsterBook_DrawLeftLayer(uint8_t* pBytes) {
             continue;
         }
 
-        // Read MonsterBookCard at m_aCardTable[currentTab][i].p. ZArray uses
-        // the V95Ref 8-byte stride (pad0 + p), so .p is the actual card ptr.
+        // Read MonsterBookCard at m_aCardTable[currentTab][pageOffset + i].p.
+        // ZArray uses the V95Ref 8-byte stride (pad0 + p), so .p is the
+        // actual card ptr.
         //
         // CMonsterBookAccessor::SetCount (v95 0x009118F0) stores the card via:
         //   lea ecx, [eax - 0x50E0]
@@ -1063,9 +1091,12 @@ static void MonsterBook_DrawLeftLayer(uint8_t* pBytes) {
         // Recovery: cardId = uint16_t(stored) + 0x002450E0 = stored + 2380000.
         // (Naïve `int16_t(stored) + 0x50E0` is wrong because it sign-extends
         //  high cardIds and drops the 0x0024 prefix.)
-        auto& v95Ref = tabCards[i];
+        const uint32_t cardIdx = pageOffset + static_cast<uint32_t>(i);
+        if (cardIdx >= cardCount) continue;
+        auto& v95Ref = tabCards[cardIdx];
         if (!v95Ref.p) {
-            DEBUG_MESSAGE("  cell %d: V95Ref.p is NULL — skip", i);
+            DEBUG_MESSAGE("  cell %d (idx %u): V95Ref.p is NULL — skip",
+                          i, cardIdx);
             continue;
         }
         const uint16_t storedRaw = *reinterpret_cast<uint16_t*>(v95Ref.p);
@@ -1344,11 +1375,142 @@ void CCtrlRPTab::CreateCtrlFromRect(CWnd* pParent, uint32_t nId,
 }
 
 
+// === Page navigation ========================================================
+//
+// Total left-pages for the current tab = ceil(cardCount / 25). Used by the
+// arrow buttons to clamp m_nLeftPage and by DrawLeftLayer to slice the card
+// list. Right-page bound stays at >=0; LAYER[1] doesn't render real content
+// yet so the upper bound is symbolic.
+namespace {
+    int32_t MonsterBook_GetCurrentTab(uint8_t* pBytes) {
+        auto* pLPTab = *reinterpret_cast<CCtrlLPTab**>(pBytes + 0x1564);
+        if (!pLPTab) return -1;
+        const int32_t tab = pLPTab->m_nCurrentTab;
+        return (tab < 0 || tab >= 9) ? -1 : tab;
+    }
+
+    uint32_t MonsterBook_GetTabCardCount(uint8_t* pBytes, int32_t tab) {
+        if (tab < 0 || tab >= 9) return 0;
+        auto* pCardTableArrays = reinterpret_cast<ZArray<V95Ref>*>(pBytes + 0x1888);
+        return pCardTableArrays[tab].GetCount();
+    }
+
+    int32_t MonsterBook_LeftPageMax(uint8_t* pBytes) {
+        const int32_t tab = MonsterBook_GetCurrentTab(pBytes);
+        const uint32_t cnt = MonsterBook_GetTabCardCount(pBytes, tab);
+        if (cnt == 0) return 0;
+        return static_cast<int32_t>((cnt - 1) / 25);
+    }
+
+    void MonsterBook_MarkLayerDirty(uint8_t* pBytes, size_t dirtyOffset) {
+        *reinterpret_cast<int32_t*>(pBytes + dirtyOffset) = 1;
+    }
+
+    void MonsterBook_ResetPageState() {
+        g_nLeftPage  = 0;
+        g_nRightPage = 0;
+    }
+}
+
+// KMST 0x00848185 (60 lines) — CUIMonsterBook::OnButtonClicked. Six button
+// IDs handled:
+//   1000  (close button)         — let v95's CUIWnd dtor chain handle it via
+//                                  the CWvsContext +0x3EB4 slot-clear path.
+//                                  Nothing for us to do.
+//   2000  (search button)        — KMST reads the search box text, calls
+//                                  SearchCard + SelectCard. Both KMST helpers
+//                                  were stripped in v95 and need WZ string-
+//                                  index search infrastructure we haven't
+//                                  ported. For this iteration we just log
+//                                  the click; real search is a follow-up.
+//   0x07D1 (left page prev)      — m_nLeftPage--, clamp to 0, re-paint LAYER[0]
+//   0x07D2 (left page next)      — m_nLeftPage++, clamp to leftPageMax
+//   0x07D3 (right page prev)     — m_nRightPage-- (LAYER[1] is stub for now)
+//   0x07D4 (right page next)     — m_nRightPage++
+// Other IDs fall through to the original CWnd::OnButtonClicked no-op.
+static void MonsterBook_OnButtonClicked(uint8_t* pBytes, uint32_t nId) {
+    switch (nId) {
+    case 1000:
+        DEBUG_MESSAGE("MonsterBook_OnButtonClicked: close (1000) — let v95 handle");
+        return;
+    case 2000: {
+        DEBUG_MESSAGE("MonsterBook_OnButtonClicked: search (2000)");
+        // Read the edit text for logging. Real per-name card search comes
+        // when we wire up the WZ String/Mob.img name index — this is the
+        // visible-payoff scaffolding.
+        auto* pEdit = *reinterpret_cast<CCtrlEdit**>(pBytes + 0x1570);
+        if (pEdit) {
+            DEBUG_MESSAGE("  edit ptr ok @0x%08X — search no-op pending name index",
+                          pEdit);
+        } else {
+            DEBUG_MESSAGE("  edit slot is NULL");
+        }
+        return;
+    }
+    case 0x07D1: {
+        const int32_t prev = g_nLeftPage;
+        if (g_nLeftPage > 0) {
+            --g_nLeftPage;
+        }
+        DEBUG_MESSAGE("MonsterBook_OnButtonClicked: left-prev %d -> %d",
+                      prev, g_nLeftPage);
+        MonsterBook_MarkLayerDirty(pBytes, 0x15A0);
+        return;
+    }
+    case 0x07D2: {
+        const int32_t prev = g_nLeftPage;
+        const int32_t maxPage = MonsterBook_LeftPageMax(pBytes);
+        if (g_nLeftPage < maxPage) {
+            ++g_nLeftPage;
+        }
+        DEBUG_MESSAGE("MonsterBook_OnButtonClicked: left-next %d -> %d (max=%d)",
+                      prev, g_nLeftPage, maxPage);
+        MonsterBook_MarkLayerDirty(pBytes, 0x15A0);
+        return;
+    }
+    case 0x07D3: {
+        const int32_t prev = g_nRightPage;
+        if (g_nRightPage > 0) {
+            --g_nRightPage;
+        }
+        DEBUG_MESSAGE("MonsterBook_OnButtonClicked: right-prev %d -> %d",
+                      prev, g_nRightPage);
+        MonsterBook_MarkLayerDirty(pBytes, 0x15A8);
+        return;
+    }
+    case 0x07D4: {
+        const int32_t prev = g_nRightPage;
+        ++g_nRightPage;
+        DEBUG_MESSAGE("MonsterBook_OnButtonClicked: right-next %d -> %d",
+                      prev, g_nRightPage);
+        MonsterBook_MarkLayerDirty(pBytes, 0x15A8);
+        return;
+    }
+    default:
+        DEBUG_MESSAGE("MonsterBook_OnButtonClicked: unhandled id=%u (0x%X)",
+                      nId, nId);
+        return;
+    }
+}
+
+
 // === Hooks ==================================================================
 
 static auto CWvsContext__UI_Open = kCWvsContext_UI_Open;
 static auto CWvsContext__UI_Close = kCWvsContext_UI_Close;
 static auto CWnd__Update = kCWnd_Update;
+static auto CWnd__OnButtonClicked = kCWnd_OnButtonClicked;
+
+void __fastcall CWnd__OnButtonClicked_hook(void* pThis, void* /*EDX*/, uint32_t nId) {
+    // Detoured globally over CWnd::OnButtonClicked. Filter on our wnd; let
+    // every other CWnd subclass that inherits the no-op pass through. The
+    // base impl returns immediately so the post-call tail is just the ret.
+    if (pThis != nullptr && pThis == g_pV95MonsterBookGlobal) {
+        MonsterBook_OnButtonClicked(static_cast<uint8_t*>(pThis), nId);
+    }
+    reinterpret_cast<void(__thiscall*)(void*, uint32_t)>(CWnd__OnButtonClicked)(
+        pThis, nId);
+}
 
 void __fastcall CWnd__Update_hook(void* pThis, void* /*EDX*/) {
     // Every CWnd::Update call in the v95 client flows through this hook —
@@ -1386,6 +1548,7 @@ void __fastcall CWvsContext__UI_Open_hook(void* pCtx, void* /*EDX*/,
         DEBUG_MESSAGE("  s_Alloc(0x%X) -> 0x%08X",
                       static_cast<unsigned>(kCUIMonsterBookSize), pBuf);
         std::memset(pBuf, 0, kCUIMonsterBookSize);
+        MonsterBook_ResetPageState();
         MonsterBook_Construct(pBuf);
 
         // Hook the window into v95's canonical close machinery: bump the
@@ -1448,4 +1611,9 @@ void AttachUIMonsterBook() {
     ATTACH_HOOK(CWvsContext__UI_Close, CWvsContext__UI_Close_hook);
     // Hooks every CWnd::Update — filtered to our wnd inside the detour.
     ATTACH_HOOK(CWnd__Update, CWnd__Update_hook);
+    // Hooks every CWnd::OnButtonClicked (the base no-op CWnd subclasses
+    // inherit when they don't override) — filtered to our wnd inside the
+    // detour. Other inheritors of the base see no behavior change since the
+    // hook tail-calls the original ret-4.
+    ATTACH_HOOK(CWnd__OnButtonClicked, CWnd__OnButtonClicked_hook);
 }
