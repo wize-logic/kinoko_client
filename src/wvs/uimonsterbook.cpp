@@ -877,12 +877,19 @@ namespace {
         }
 
         const wchar_t* kProbes[] = {
-            L"Etc/MonsterBook.img",
-            L"Etc/MonsterBook.list",
-            L"Etc/MonsterBookSet.img",
-            L"Etc/Monster.img",
-            L"Quest/MonsterBook.img",
-            L"String/MonsterBook.img",
+            // Confirmed v95 LoadCard path.
+            L"Item/Consume/0238.img",
+            // Try cardId leaf in multiple formats — first cardId from log
+            // is 2400704; if WZ keys are 0238-prefix (= 2380xxx range only),
+            // 2400704 might not appear at all and probing helps identify.
+            L"Item/Consume/0238.img/02400704",
+            L"Item/Consume/0238.img/2400704",
+            L"Item/Consume/0238.img/02400704/info",
+            L"Item/Consume/0238.img/02400704/info/mob",
+            // Compare against 0240.img (where 02400xxx items naturally live).
+            L"Item/Consume/0240.img",
+            L"Item/Consume/0240.img/02400704",
+            L"Item/Consume/0240.img/02400704/info/mob",
         };
         for (const wchar_t* p : kProbes) {
             try {
@@ -901,23 +908,47 @@ namespace {
         if (it != g_cardToMob.end()) {
             return it->second;
         }
-        // Diagnostic on first-ever resolve: exhaustive path probe so the next
-        // log run pinpoints the right WZ namespace + cardId-leaf format.
+        // First-call diagnostic the once: log v95's path string + try a few
+        // candidate cardId-leaf formats to pinpoint the right one.
         MonsterBook_ProbeWzPaths(cardId);
 
+        // v95 StringPool[0xF20] confirmed `Item/Consume/0238.img` is the base.
+        // Candidate cardId-leaf formats; try each and use whichever returns
+        // a non-zero `mob` int. Cache the winning format on the first success
+        // so subsequent calls only try one path.
+        static const wchar_t* const kFormats[] = {
+            L"Item/Consume/0238.img/%d/info/mob",        // unpadded decimal
+            L"Item/Consume/0238.img/0%07d/info/mob",     // zero-padded 8-digit
+            L"Item/Consume/0238.img/%07d/info/mob",      // zero-padded 7-digit
+            L"Item/Consume/0238.img/%08d/info/mob",      // zero-padded 8-digit (no leading 0)
+        };
+        static int s_winningFormat = -1;
+
         int32_t mobId = 0;
-        try {
-            wchar_t sPath[64];
-            swprintf_s(sPath, 64, L"Etc/MonsterBook.img/%d/mob", cardId);
-            // ResMan returns the property's variant — for an int leaf the
-            // variant holds VT_I4. get_int32 unwraps + handles missing keys.
-            mobId = static_cast<int32_t>(get_int32(
-                get_rm()->GetObjectA(Ztl_bstr_t(sPath)), 0));
-        } catch (const _com_error& e) {
-            DEBUG_MESSAGE("  ResolveMobId(%d) threw 0x%08X (%s)",
-                          cardId, static_cast<unsigned>(e.Error()),
-                          e.ErrorMessage());
+        wchar_t sPath[80];
+
+        if (s_winningFormat >= 0) {
+            try {
+                swprintf_s(sPath, 80, kFormats[s_winningFormat], cardId);
+                mobId = static_cast<int32_t>(get_int32(
+                    get_rm()->GetObjectA(Ztl_bstr_t(sPath)), 0));
+            } catch (const _com_error&) {}
+        } else {
+            for (size_t i = 0; i < std::size(kFormats); ++i) {
+                try {
+                    swprintf_s(sPath, 80, kFormats[i], cardId);
+                    mobId = static_cast<int32_t>(get_int32(
+                        get_rm()->GetObjectA(Ztl_bstr_t(sPath)), 0));
+                    if (mobId != 0) {
+                        s_winningFormat = static_cast<int>(i);
+                        DEBUG_MESSAGE("  ResolveMobId: format[%zu] (%S) wins for card=%d -> mob=%d",
+                                      i, kFormats[i], cardId, mobId);
+                        break;
+                    }
+                } catch (const _com_error&) {}
+            }
         }
+
         g_cardToMob[cardId] = mobId;
         DEBUG_MESSAGE("  ResolveMobId: card=%d -> mob=%d", cardId, mobId);
         return mobId;
@@ -1656,6 +1687,16 @@ void __fastcall CWnd__OnChildNotify_hook(void* pThis, void* /*EDX*/,
     // Detoured over CWnd::OnChildNotify. msg==100 means a button click;
     // for our wnd, run our handler before chaining to the original (which
     // dispatches via vtable[8] = CUIWnd::OnButtonClicked → close path).
+    //
+    // DIAGNOSTIC: log every fire when id is in our wnd's button range so
+    // we can pinpoint which parent the close-button's MouseUp is dispatching
+    // on. Filter is intentionally narrower than the action filter so we
+    // don't spam every CWnd dispatch in the entire UI.
+    if (nMsg == 100 && (nId == 1000 || (nId >= 0x07D0 && nId <= 0x07D6))) {
+        DEBUG_MESSAGE("OnChildNotify_hook: pThis=0x%08X global=0x%08X id=%u msg=%u",
+                      pThis, g_pV95MonsterBookGlobal,
+                      nId, nMsg);
+    }
     if (pThis != nullptr && pThis == g_pV95MonsterBookGlobal && nMsg == 100) {
         MonsterBook_OnButtonClicked(static_cast<uint8_t*>(pThis), nId);
     }
