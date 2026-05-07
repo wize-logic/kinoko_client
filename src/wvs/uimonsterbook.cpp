@@ -3,6 +3,7 @@
 #include "debug.h"
 #include "ztl/ztl.h"
 #include "ztl/zcom.h"
+#include "common/iteminfo.h"
 #include "wvs/uimonsterbook.h"
 #include "wvs/ctrlwnd.h"
 #include "wvs/util.h"
@@ -10,6 +11,8 @@
 
 #include <algorithm>
 #include <cstring>
+#include <cwchar>
+#include <unordered_map>
 
 
 // === Layout / sizing ========================================================
@@ -702,6 +705,7 @@ static void MonsterBook_Construct(void* pThis) {
 // Do NOT s_Free the buffer here — v95's scalar_deleting_dtor (reached
 // through the vtable Release call) does that, and an extra s_Free here
 // would double-free.
+namespace { void MonsterBook_ClearPortraitCache(); }
 static void MonsterBook_PreDestroy(void* pThis) {
     DEBUG_MESSAGE("MonsterBook_PreDestroy: enter pThis=0x%08X", pThis);
     auto* pBytes = static_cast<uint8_t*>(pThis);
@@ -781,7 +785,96 @@ static void MonsterBook_PreDestroy(void* pThis) {
         }
     }
 
+    // Drop the per-card portrait cache. Holds strong COM refs to mob canvases
+    // and a small cardId→mobId map; both rebuild on next /book open.
+    MonsterBook_ClearPortraitCache();
+
     DEBUG_MESSAGE("MonsterBook_PreDestroy: done");
+}
+
+
+// === Card-portrait resolution + cache =======================================
+//
+// KMST DrawLeftLayer reads `card->[+0x10]` to get a cached IWzCanvas* for the
+// per-card mob portrait — that field is loaded during KMST's CMonsterBookMan::
+// LoadCard/LoadBook. v95 strips the canvas-cache field from MonsterBookCard
+// (only `(short)(cardId-0x50E0)` at +0 and `(byte)count` at +2 survive — see
+// CMonsterBookAccessor::SetCount @ 0x009118F0). To paint the real mob portrait
+// we have to resolve cardId → mobId and load the canvas ourselves.
+//
+// Resolution path: `Item.wz/Consume/0238.img/<cardId>/info/mob` is an int
+// property (mobId). v95 exposes CItemInfo::GetItemInfo(itemId) at 0x005A8F20
+// which returns the corresponding IWzPropertyPtr; we read the `info/mob` int
+// from there. Once we have mobId we load `Mob/%07d.img/stand/0` via ResMan.
+//
+// Both maps are populated on demand and cleared by MonsterBook_PreDestroy.
+// Caching is essential: a /book session repaints LAYER[0] every dirty cycle
+// (~once per Update tick), so re-probing 25 WZ paths per frame would tank
+// the frame rate and re-walk the WZ archive needlessly.
+
+namespace {
+    std::unordered_map<int32_t, int32_t> g_cardToMob;
+    std::unordered_map<int32_t, IWzCanvasPtr> g_mobIcon;
+
+    // Resolve cardId (5xxxxxx) → mobId by reading the WZ property tree once
+    // per cardId. Misses (e.g. non-card items, cards lacking `info/mob`) are
+    // cached as 0 so we don't keep probing for a missing key every frame.
+    int32_t MonsterBook_ResolveMobId(int32_t cardId) {
+        auto it = g_cardToMob.find(cardId);
+        if (it != g_cardToMob.end()) {
+            return it->second;
+        }
+        int32_t mobId = 0;
+        try {
+            if (auto* pInfo = CItemInfo::GetInstance()) {
+                IWzPropertyPtr pProp = pInfo->GetItemInfo(cardId);
+                if (pProp) {
+                    IWzPropertyPtr pInfoNode = pProp->item[L"info"].GetUnknown();
+                    if (pInfoNode) {
+                        mobId = static_cast<int32_t>(get_int32(
+                            pInfoNode->item[L"mob"], 0));
+                    }
+                }
+            }
+        } catch (const _com_error& e) {
+            DEBUG_MESSAGE("  ResolveMobId(%d) threw 0x%08X (%s)",
+                          cardId, static_cast<unsigned>(e.Error()),
+                          e.ErrorMessage());
+        }
+        g_cardToMob[cardId] = mobId;
+        DEBUG_MESSAGE("  ResolveMobId: card=%d -> mob=%d", cardId, mobId);
+        return mobId;
+    }
+
+    // Load and cache `Mob/<mobId>.img/stand/0`. Holding a strong COM ref
+    // keeps the canvas alive across paint frames; without the cache ResMan
+    // would walk the archive again on each Copy() call.
+    IWzCanvasPtr MonsterBook_LoadMobIcon(int32_t mobId) {
+        if (mobId <= 0) {
+            return nullptr;
+        }
+        auto it = g_mobIcon.find(mobId);
+        if (it != g_mobIcon.end()) {
+            return it->second;
+        }
+        IWzCanvasPtr pCanvas;
+        try {
+            wchar_t sPath[64];
+            swprintf_s(sPath, 64, L"Mob/%07d.img/stand/0", mobId);
+            pCanvas = get_unknown(get_rm()->GetObjectA(Ztl_bstr_t(sPath)));
+        } catch (const _com_error& e) {
+            DEBUG_MESSAGE("  LoadMobIcon(%d) threw 0x%08X (%s)",
+                          mobId, static_cast<unsigned>(e.Error()),
+                          e.ErrorMessage());
+        }
+        g_mobIcon[mobId] = pCanvas;
+        return pCanvas;
+    }
+
+    void MonsterBook_ClearPortraitCache() {
+        g_mobIcon.clear();
+        g_cardToMob.clear();
+    }
 }
 
 
@@ -928,11 +1021,16 @@ static void MonsterBook_DrawLeftLayer(uint8_t* pBytes) {
     //   per-cell origin: (i%5)*0x21 + 8, (i/5)*0x2D + 0x1F
     //   per-cell size:   (0x1B, 0x26)
     //
-    // Card colour palette: each slot gets a colour derived from its slot
-    // index so collected vs missing is visually obvious. Populated slots
-    // (index < cardCount) render in a bright cyan→magenta gradient; empty
-    // slots render in dim grey. This is the placeholder visualization;
-    // future port replaces with the real Mob/%07d.img canvas paint.
+    // Per populated cell we resolve cardId from m_aCardTable[currentTab][i].p
+    // (MonsterBookCard*; cardId stored as `(short)(cardId - 0x50E0)` at +0,
+    // count byte at +2 — verified via CMonsterBookAccessor::SetCount disasm),
+    // then resolve cardId → mobId via Item.wz and Copy the loaded
+    // `Mob/%07d.img/stand/0` canvas onto the cell. The blit currently does
+    // not clip to cell bounds, so portraits larger than (0x1B-4, 0x26-4) =
+    // (23, 34) pixels will bleed into adjacent cells. KMST's body sets a
+    // SetClipRect token at the start of DrawLeftLayer (vfunc 0x84 @ 0x49F8),
+    // restored at the end — we'll wire that in a follow-up once Windows
+    // iteration confirms portraits load and the bleed becomes the next gap.
     constexpr int32_t kCellsPerPage = 25;
     const uint32_t pageCount = std::min<uint32_t>(cardCount, kCellsPerPage);
     for (int i = 0; i < kCellsPerPage; ++i) {
@@ -940,25 +1038,65 @@ static void MonsterBook_DrawLeftLayer(uint8_t* pBytes) {
         const int32_t cellY = (i / 5) * 0x2D + 0x1F;
         const bool populated = (static_cast<uint32_t>(i) < pageCount);
 
-        // Cell border (cardSlot.img placeholder).
+        // Cell border (cardSlot.img placeholder — replaced with the real WZ
+        // cardSlot frame in a follow-up; that's a separate WZ probe).
         const uint32_t borderColor = populated ? 0xFF80C0FF : 0xFF606060;
         try {
             pCanvas->DrawRectangle(cellX, cellY, 0x1B, 0x26, borderColor);
         } catch (const _com_error&) { return; }
 
-        if (populated) {
-            // Inset content: bright pixel block proportional to cell index.
-            // Colour cycles through HSV-like wheel so different cards look
-            // different — this is purely diagnostic; the real port replaces
-            // this with the mob portrait canvas blit.
-            const uint32_t r = static_cast<uint32_t>((i * 11) & 0xFF);
-            const uint32_t g = static_cast<uint32_t>(((25 - i) * 9) & 0xFF);
-            const uint32_t b = static_cast<uint32_t>((i * 23) & 0xFF);
-            const uint32_t cellFill = 0xFF000000u | (r << 16) | (g << 8) | b;
+        if (!populated) {
+            continue;
+        }
+
+        // Read MonsterBookCard at m_aCardTable[currentTab][i].p. ZArray uses
+        // the V95Ref 8-byte stride (pad0 + p), so .p is the actual card ptr.
+        //
+        // CMonsterBookAccessor::SetCount (v95 0x009118F0) stores the card via:
+        //   lea ecx, [eax - 0x50E0]
+        //   mov word ptr [card], cx     ; truncates to low 16 bits
+        //   mov byte ptr [card + 2], bl ; count
+        //
+        // So `*card` holds `(cardId - 0x50E0) & 0xFFFF`. v95 GMS monster book
+        // cards are exclusively in [2380000, 2380401], so the top 16 bits of
+        // (cardId - 0x50E0) are constant 0x0024 across the entire range.
+        // Recovery: cardId = uint16_t(stored) + 0x002450E0 = stored + 2380000.
+        // (Naïve `int16_t(stored) + 0x50E0` is wrong because it sign-extends
+        //  high cardIds and drops the 0x0024 prefix.)
+        auto& v95Ref = tabCards[i];
+        if (!v95Ref.p) {
+            DEBUG_MESSAGE("  cell %d: V95Ref.p is NULL — skip", i);
+            continue;
+        }
+        const uint16_t storedRaw = *reinterpret_cast<uint16_t*>(v95Ref.p);
+        const int32_t  cardId    = static_cast<int32_t>(storedRaw) + 2380000;
+        const int32_t  mobId     = MonsterBook_ResolveMobId(cardId);
+        IWzCanvasPtr   pMobCanvas = MonsterBook_LoadMobIcon(mobId);
+
+        if (!pMobCanvas) {
+            // Resolution failure — paint a dim red inset so the cell still
+            // visibly registers as collected without falsely displaying a
+            // portrait we couldn't load.
             try {
                 pCanvas->DrawRectangle(cellX + 2, cellY + 2,
-                                       0x1B - 4, 0x26 - 4, cellFill);
+                                       0x1B - 4, 0x26 - 4, 0xFF402020);
             } catch (const _com_error&) { return; }
+            continue;
+        }
+
+        try {
+            // Clear the cell interior then composite the mob portrait. KMST
+            // composites at the per-card RECT origin via vfunc 0x80 (Copy),
+            // optional alpha VARIANT controls the blend. We pass full alpha
+            // (0xFF) for collected cards. Cell-interior offset is +1 inside
+            // the border rect so the portrait doesn't overpaint the frame.
+            pCanvas->DrawRectangle(cellX + 1, cellY + 1,
+                                   0x1B - 2, 0x26 - 2, 0xFF000000);
+            pCanvas->Copy(cellX + 1, cellY + 1, pMobCanvas);
+        } catch (const _com_error& e) {
+            DEBUG_MESSAGE("  cell %d card=%d mob=%d: Copy threw 0x%08X (%s)",
+                          i, cardId, mobId,
+                          static_cast<unsigned>(e.Error()), e.ErrorMessage());
         }
     }
 
