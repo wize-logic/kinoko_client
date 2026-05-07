@@ -10,8 +10,10 @@
 #include "wvs/wnd.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstring>
 #include <cwchar>
+#include <string>
 #include <unordered_map>
 
 
@@ -77,6 +79,24 @@ constexpr uintptr_t kCWnd_Update                          = 0x009AE7C0;
 // cleaner upstream cut.
 constexpr uintptr_t kCWnd_OnChildNotify                   = 0x00429260;
 
+// CUIWnd::HitTest at 0x008DD2C0 (override of CWnd::HitTest @ 0x009AE3B0).
+// The wnd-manager calls this on every mouse-event tick to ask "is the cursor
+// over you, and if so on which child?" — receives (rx, ry) in wnd-local
+// pixel coords. We hook it solely to capture (rx, ry) into a per-wnd cache
+// so the polling-side click detector (in Update) can hit-test against the
+// cell rect array without having to do a screen→canvas→wnd coordinate
+// transform itself. The original is always invoked via the trampoline so
+// the wnd-manager's actual hit-test result is unaffected.
+constexpr uintptr_t kCUIWnd_HitTest                       = 0x008DD2C0;
+
+// CUIWnd::OnMouseEnter at 0x008DD2A0 (override of CWnd::OnMouseEnter @
+// 0x009AD370). Wnd-manager calls bEnter=1 when the cursor crosses into our
+// wnd's region, bEnter=0 when it leaves. We hook the bEnter=0 path to
+// invalidate the cached HitTest coords — without it, a click after the
+// cursor moves outside our wnd would still see the last in-wnd coords and
+// could spuriously update g_nSelectedCard.
+constexpr uintptr_t kCUIWnd_OnMouseEnter                  = 0x008DD2A0;
+
 
 // === Mod-side state =========================================================
 
@@ -106,9 +126,24 @@ namespace {
 
     // Currently-selected card slot index on the left page (0..24). KMST
     // stores at +0x7C0 (= v95 +0xE60). DrawSelectLayer composites the cursor
-    // overlay at m_aRect[g_nSelectedCard]. Click/key handlers updating this
-    // value are deferred — for now defaults to 0 (top-left cell highlighted).
+    // overlay at m_aRect[g_nSelectedCard]. Updated on left-mouse-up over a
+    // populated cell — see hit-test in MonsterBook_Update below.
     int32_t g_nSelectedCard = 0;
+
+    // Wnd-local mouse coords captured by the CUIWnd::HitTest hook. The wnd-
+    // manager calls HitTest on every mouse-move/click tick with the cursor
+    // pos already transformed into wnd-local; we cache here so the click
+    // detector in Update can hit-test cells without doing the screen→canvas
+    // transform itself. (-1, -1) means "no hit-test seen since open" —
+    // suppresses spurious cell selects on the open frame if the user
+    // happened to be holding the mouse button when /book was triggered.
+    int32_t  g_nLastHitX     = -1;
+    int32_t  g_nLastHitY     = -1;
+
+    // Edge-detect for VK_LBUTTON. Mouse-up is the canonical "click" trigger
+    // (matches CCtrlButton dispatch). On the falling edge we hit-test the
+    // cached (g_nLastHitX, g_nLastHitY) against m_aRect[0..24].
+    bool     g_bLeftBtnDown  = false;
 }
 
 
@@ -837,6 +872,9 @@ static void MonsterBook_PreDestroy(void* pThis) {
 
 namespace {
     std::unordered_map<int32_t, IWzCanvasPtr> g_cardIcon;
+    std::unordered_map<int32_t, int32_t>      g_cardToMobId;
+    std::unordered_map<int32_t, IWzCanvasPtr> g_mobPortrait;
+    std::unordered_map<int32_t, std::string>  g_mobName;
 
     // Load and cache the per-cardId card-art icon canvas. The path
     // `Item/Consume/0238.img/<cardId>/info/iconRaw` (zero-padded 8-digit)
@@ -865,8 +903,89 @@ namespace {
         return pCanvas;
     }
 
+    // Resolve cardId → mobId via WZ. Cached per cardId.
+    int32_t MonsterBook_ResolveMobId(int32_t cardId) {
+        auto it = g_cardToMobId.find(cardId);
+        if (it != g_cardToMobId.end()) return it->second;
+        int32_t mobId = 0;
+        try {
+            wchar_t sPath[80];
+            swprintf_s(sPath, 80,
+                       L"Item/Consume/0238.img/0%07d/info", cardId);
+            IWzPropertyPtr pInfo =
+                get_unknown(get_rm()->GetObjectA(Ztl_bstr_t(sPath)));
+            if (pInfo) {
+                mobId = static_cast<int32_t>(
+                    get_int32(pInfo->item[L"mob"], 0));
+            }
+        } catch (const _com_error& e) {
+            DEBUG_MESSAGE("  ResolveMobId(%d) threw 0x%08X (%s)",
+                          cardId, static_cast<unsigned>(e.Error()),
+                          e.ErrorMessage());
+        }
+        g_cardToMobId[cardId] = mobId;
+        return mobId;
+    }
+
+    // Load mob walking-sprite stand frame 0. Cached per-mobId.
+    IWzCanvasPtr MonsterBook_LoadMobPortrait(int32_t mobId) {
+        auto it = g_mobPortrait.find(mobId);
+        if (it != g_mobPortrait.end()) return it->second;
+        IWzCanvasPtr pCanvas;
+        if (mobId > 0) {
+            try {
+                wchar_t sPath[80];
+                swprintf_s(sPath, 80, L"Mob/%07d.img/stand/0", mobId);
+                pCanvas = get_unknown(get_rm()->GetObjectA(
+                    Ztl_bstr_t(sPath)));
+            } catch (const _com_error& e) {
+                DEBUG_MESSAGE("  LoadMobPortrait(%d) threw 0x%08X (%s)",
+                              mobId, static_cast<unsigned>(e.Error()),
+                              e.ErrorMessage());
+            }
+        }
+        g_mobPortrait[mobId] = pCanvas;
+        return pCanvas;
+    }
+
     void MonsterBook_ClearPortraitCache() {
         g_cardIcon.clear();
+        g_cardToMobId.clear();
+        g_mobPortrait.clear();
+        g_mobName.clear();
+    }
+
+    // Resolve mobId → display name via String.wz/Mob.img/<mobId>/name.
+    // Cached per-mobId. Returns empty string on failure (search will skip).
+    const std::string& MonsterBook_LookupMobName(int32_t mobId) {
+        auto it = g_mobName.find(mobId);
+        if (it != g_mobName.end()) return it->second;
+        std::string name;
+        if (mobId > 0) {
+            try {
+                wchar_t sPath[80];
+                swprintf_s(sPath, 80, L"String/Mob.img/%d", mobId);
+                IWzPropertyPtr pMob =
+                    get_unknown(get_rm()->GetObjectA(Ztl_bstr_t(sPath)));
+                if (pMob) {
+                    Ztl_variant_t vName = pMob->item[L"name"];
+                    if (V_VT(&vName) == VT_BSTR && V_BSTR(&vName)) {
+                        const wchar_t* pw = V_BSTR(&vName);
+                        const int n = ::WideCharToMultiByte(
+                            CP_ACP, 0, pw, -1, nullptr, 0, nullptr, nullptr);
+                        if (n > 0) {
+                            name.resize(n - 1);
+                            ::WideCharToMultiByte(
+                                CP_ACP, 0, pw, -1, &name[0], n,
+                                nullptr, nullptr);
+                        }
+                    }
+                }
+            } catch (const _com_error&) {
+                /* leave name empty */
+            }
+        }
+        return g_mobName.emplace(mobId, std::move(name)).first->second;
     }
 }
 
@@ -931,6 +1050,46 @@ namespace {
             DEBUG_MESSAGE("  [%s] paint threw HRESULT 0x%08X (%s)",
                           tag, static_cast<unsigned>(e.Error()), e.ErrorMessage());
         }
+    }
+
+    // KMST CUIMonsterBook::HitTest equivalent (no PDB symbol — likely
+    // inlined). Walks m_aRect[0..24] looking for PtInRect((rxL0, ryL0)).
+    // Returns the 0..24 cell index, or -1 if none hit.
+    //
+    // Coords are LAYER[0]-local: m_aRect was built in CreateRect with cell
+    // origin (8, 0x1F) which is LAYER[0]-relative (LAYER[0] sits at wnd-
+    // local origin (40, 25); see kLayers[0] in CreateLayer).
+    int32_t MonsterBook_CellHitTest(uint8_t* pBytes,
+                                    int32_t rxLayer, int32_t ryLayer) {
+        auto* pRects = reinterpret_cast<RECT*>(pBytes + 0x15B8);
+        const POINT pt = { rxLayer, ryLayer };
+        for (int i = 0; i < 25; ++i) {
+            if (::PtInRect(&pRects[i], pt)) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    // Top-of-page tab indicator strip painted by DrawLeftLayer: 9 segments
+    // at LAYER[0]-local (8 + t*0x12, 4) sized (0x10, 0x0C). Returns the tab
+    // index 0..8 if the click landed in one, or -1 otherwise.
+    //
+    // KMST's real LPTab (CCtrlLPTab) on the left edge of the wnd carries the
+    // canonical tab visuals + click handling, but the visuals require a WZ
+    // tab-tree iteration we haven't ported (~660 lines combined). The top
+    // indicator strip we DO paint is the only currently-visible UI cue for
+    // tab state — repurposing it as a click target gives users a working
+    // tab switcher without porting the heavyweight LPTab body.
+    int32_t MonsterBook_TabStripHitTest(int32_t rxLayer, int32_t ryLayer) {
+        if (ryLayer < 4 || ryLayer >= 4 + 0x0C) return -1;
+        for (int t = 0; t < 9; ++t) {
+            const int32_t segX = 8 + t * 0x12;
+            if (rxLayer >= segX && rxLayer < segX + 0x10) {
+                return t;
+            }
+        }
+        return -1;
     }
 }
 
@@ -1114,14 +1273,128 @@ static void MonsterBook_DrawLeftLayer(uint8_t* pBytes) {
                   currentTab, pageCount, kCellsPerPage);
 }
 
-// KMST DrawRightLayer (no PDB symbol — likely inlined or stripped).
-// DEFERRED: would render the per-card detail panel on the right side
-// (mob portrait + drops + skill). Stub: translucent magenta.
+// KMST DrawRightLayer (no PDB symbol — stripped). Best-effort original port:
+// the right-side detail panel for the currently-selected card. KMST's full
+// body would composite mob portrait + drops + skill panels with WZ-loaded
+// frames; we ship a focused visual that proves selection-driven repaint
+// works:
+//   - Dark background + light border framing
+//   - Card-art icon scaled 3x and centred in the upper half (the same
+//     `info/iconRaw` we use in cells, just bigger)
+//   - Mob walking-sprite (`Mob/%07d.img/stand/0`) below it, cardId-resolved
+//     via `Item/Consume/0238.img/<cardId>/info/mob` (int prop)
+// When no card is selected (g_nSelectedCard out of populated range for the
+// page) the panel paints empty with the border outline only.
+//
+// LAYER[1] geometry (CreateLayer kLayers[2]): wnd-local origin (240, 20),
+// canvas 0xDC x 0x122 = 220 x 290. Inner content area we use is the
+// 220 x 290 rect minus a 4px frame inset.
 static void MonsterBook_DrawRightLayer(uint8_t* pBytes) {
-    DEBUG_MESSAGE("MonsterBook_DrawRightLayer: stub fill");
-    PaintLayerStub(pBytes, /*slotOffset=*/0x15AC,
-                   /*width=*/0xDC, /*height=*/0x122,
-                   /*color (ARGB)=*/0xC0A040A0, "L1");
+    auto* pLayer = *reinterpret_cast<IWzGr2DLayer**>(pBytes + 0x15AC);
+    if (!pLayer) {
+        DEBUG_MESSAGE("MonsterBook_DrawRightLayer: LAYER[1] is null");
+        return;
+    }
+    IWzCanvasPtr pCanvas;
+    try {
+        pCanvas = pLayer->canvas[vtEmpty];
+    } catch (const _com_error& e) {
+        DEBUG_MESSAGE("  pLayer->canvas threw 0x%08X (%s)",
+                      e.Error(), e.ErrorMessage());
+        return;
+    }
+    if (!pCanvas) {
+        DEBUG_MESSAGE("  LAYER[1] canvas is NULL");
+        return;
+    }
+
+    // Background fill + thin frame border.
+    constexpr unsigned long kPanelW = 0xDC;
+    constexpr unsigned long kPanelH = 0x122;
+    try {
+        pCanvas->DrawRectangle(0, 0, kPanelW, kPanelH, 0xFF202020);
+        pCanvas->DrawRectangle(0, 0, kPanelW, 1, 0xFF80C0FF);
+        pCanvas->DrawRectangle(0, kPanelH - 1, kPanelW, 1, 0xFF80C0FF);
+        pCanvas->DrawRectangle(0, 0, 1, kPanelH, 0xFF80C0FF);
+        pCanvas->DrawRectangle(kPanelW - 1, 0, 1, kPanelH, 0xFF80C0FF);
+    } catch (const _com_error&) { return; }
+
+    // Resolve currently-selected card. Match the index path DrawLeftLayer
+    // uses to read the card grid: m_aCardTable[currentTab][page*25 + idx].
+    auto* pLPTab = *reinterpret_cast<CCtrlLPTab**>(pBytes + 0x1564);
+    if (!pLPTab) {
+        DEBUG_MESSAGE("  pLPTab NULL — empty panel");
+        return;
+    }
+    const int32_t currentTab = pLPTab->m_nCurrentTab;
+    if (currentTab < 0 || currentTab >= 9) return;
+
+    auto* pCardTableArrays = reinterpret_cast<ZArray<V95Ref>*>(pBytes + 0x1888);
+    auto& tabCards = pCardTableArrays[currentTab];
+    const uint32_t cardCount  = tabCards.GetCount();
+    const uint32_t pageOffset = static_cast<uint32_t>(g_nLeftPage) * 25;
+    const uint32_t cardIdx    = pageOffset + static_cast<uint32_t>(g_nSelectedCard);
+    if (cardIdx >= cardCount) {
+        DEBUG_MESSAGE("  selected idx=%u >= count=%u — empty panel",
+                      cardIdx, cardCount);
+        return;
+    }
+    auto& v95Ref = tabCards[cardIdx];
+    if (!v95Ref.p) {
+        DEBUG_MESSAGE("  selected V95Ref.p is NULL");
+        return;
+    }
+    const int32_t cardId = *reinterpret_cast<int32_t*>(v95Ref.p);
+    DEBUG_MESSAGE("MonsterBook_DrawRightLayer: tab=%d page=%d idx=%d card=%d",
+                  currentTab, g_nLeftPage, g_nSelectedCard, cardId);
+
+    // Card-art icon, scaled 3x via CopyEx into a temp canvas. Card-art is
+    // typically ~33x33; 3x = ~99x99. Centered horizontally in the panel
+    // upper half. PcCreateObject(L"Canvas") is the MapleStory-internal
+    // class factory — `CreateInstance` would hit COM and fail since
+    // L"Canvas" isn't registered with the OS COM runtime.
+    IWzCanvasPtr pIcon = MonsterBook_LoadCardIcon(cardId);
+    if (pIcon) {
+        try {
+            constexpr int kZoom = 3;
+            constexpr int kScaledW = 33 * kZoom;
+            constexpr int kScaledH = 33 * kZoom;
+            IWzCanvasPtr pZoom;
+            PcCreateObject<IWzCanvasPtr>(L"Canvas", pZoom, nullptr);
+            if (pZoom) {
+                pZoom->Create(kScaledW, kScaledH);
+                pZoom->cx = 0;
+                pZoom->cy = 0;
+                pZoom->CopyEx(0, 0, kScaledW, kScaledH, pIcon);
+                const int dstX = (static_cast<int>(kPanelW) - kScaledW) / 2;
+                const int dstY = 8;
+                pCanvas->Copy(dstX, dstY, pZoom);
+            }
+        } catch (const _com_error& e) {
+            DEBUG_MESSAGE("  card-art zoom blit threw 0x%08X (%s)",
+                          e.Error(), e.ErrorMessage());
+        }
+    }
+
+    // Mob walking-sprite directly below the card-art. Native size — most
+    // mobs are 50-150 px wide, fits inside our 220-wide panel. Centered.
+    const int32_t mobId = MonsterBook_ResolveMobId(cardId);
+    IWzCanvasPtr pMob = MonsterBook_LoadMobPortrait(mobId);
+    if (pMob) {
+        try {
+            const int dstX = static_cast<int>(kPanelW) / 2;
+            const int dstY = 33 * 3 + 24;  // below the card-art block
+            pCanvas->Copy(dstX, dstY, pMob);
+        } catch (const _com_error& e) {
+            DEBUG_MESSAGE("  mob portrait blit threw 0x%08X (%s)",
+                          e.Error(), e.ErrorMessage());
+        }
+    }
+
+    // Visual divider between card-art and mob portrait.
+    try {
+        pCanvas->DrawRectangle(8, 33 * 3 + 16, kPanelW - 16, 1, 0xFF606060);
+    } catch (const _com_error&) {}
 }
 
 // KMST 0x0084B3A0 (276 lines). Renders LAYER[2] — the selection cursor
@@ -1250,6 +1523,61 @@ static void MonsterBook_DrawLayer(uint8_t* pBytes, int layerIdx) {
 // to the original — net effect matches what KMST's vtable override would do.
 static void MonsterBook_Update(uint8_t* pBytes) {
     static constexpr size_t kDirtyOffsets[3] = { 0x15A0, 0x15A8, 0x15B0 };
+
+    // Click detection — fires on the falling edge of VK_LBUTTON. KMST has
+    // a real CUIMonsterBook::OnMouseButton that the wnd-manager dispatches
+    // to via the IUIMsgHandler vtable, but v95 stripped that override and
+    // CUIWnd inherits the no-op CWnd::OnMouseButton (verified: no
+    // ?OnMouseButton@CUIWnd@@ symbol in v95). Polling here is the cheapest
+    // working substitute — runs at the wnd-manager's tick rate when /book
+    // is open, suppressed otherwise via the pThis-filter in the Update
+    // hook itself. (g_nLastHitX/Y came from the CUIWnd::HitTest capture.)
+    const bool nowDown = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+    if (g_bLeftBtnDown && !nowDown) {
+        // Falling edge — left mouse just released. Translate cached wnd-
+        // local cursor pos to LAYER[0]-local; check tab strip first then
+        // cells. LAYER[0] sits at wnd offset (40, 25) per CreateLayer
+        // kLayers[0].
+        if (g_nLastHitX >= 0 && g_nLastHitY >= 0) {
+            const int32_t rxL0 = g_nLastHitX - 40;
+            const int32_t ryL0 = g_nLastHitY - 25;
+
+            // Tab indicator strip click → switch m_nCurrentTab.
+            const int32_t tabHit = MonsterBook_TabStripHitTest(rxL0, ryL0);
+            if (tabHit >= 0) {
+                auto* pLPTab = *reinterpret_cast<CCtrlLPTab**>(pBytes + 0x1564);
+                if (pLPTab && pLPTab->m_nCurrentTab != tabHit) {
+                    DEBUG_MESSAGE("MonsterBook_Update: tab click @wnd(%d,%d) "
+                                  "-> tab %d (was %d)",
+                                  g_nLastHitX, g_nLastHitY,
+                                  tabHit, pLPTab->m_nCurrentTab);
+                    pLPTab->m_nCurrentTab = tabHit;
+                    // New tab — different card pool, reset paging + selection.
+                    g_nLeftPage     = 0;
+                    g_nSelectedCard = 0;
+                    *reinterpret_cast<int32_t*>(pBytes + 0x15A0) = 1;
+                    *reinterpret_cast<int32_t*>(pBytes + 0x15B0) = 1;
+                }
+            } else {
+                // Cell click → update selected card index.
+                const int32_t cellHit = MonsterBook_CellHitTest(pBytes, rxL0, ryL0);
+                if (cellHit >= 0 && cellHit != g_nSelectedCard) {
+                    DEBUG_MESSAGE("MonsterBook_Update: click @wnd(%d,%d) -> "
+                                  "L0(%d,%d) -> cell %d (was %d)",
+                                  g_nLastHitX, g_nLastHitY, rxL0, ryL0,
+                                  cellHit, g_nSelectedCard);
+                    g_nSelectedCard = cellHit;
+                    // Cursor overlay (LAYER[2]) and detail panel (LAYER[1]
+                    // — stub for now, real body in a follow-up) both
+                    // depend on selection state.
+                    *reinterpret_cast<int32_t*>(pBytes + 0x15A8) = 1;
+                    *reinterpret_cast<int32_t*>(pBytes + 0x15B0) = 1;
+                }
+            }
+        }
+    }
+    g_bLeftBtnDown = nowDown;
+
     for (int i = 0; i < 3; ++i) {
         auto* pFlag = reinterpret_cast<int32_t*>(pBytes + kDirtyOffsets[i]);
         if (*pFlag != 0) {
@@ -1466,7 +1794,11 @@ namespace {
         g_nLeftPage     = 0;
         g_nRightPage    = 0;
         g_nSelectedCard = 0;
+        g_nLastHitX     = -1;
+        g_nLastHitY     = -1;
+        g_bLeftBtnDown  = false;
     }
+
 }
 
 // KMST 0x00848185 (60 lines) — CUIMonsterBook::OnButtonClicked. Six button
@@ -1492,16 +1824,77 @@ static void MonsterBook_OnButtonClicked(uint8_t* pBytes, uint32_t nId) {
         return;
     case 2000: {
         DEBUG_MESSAGE("MonsterBook_OnButtonClicked: search (2000)");
-        // Read the edit text for logging. Real per-name card search comes
-        // when we wire up the WZ String/Mob.img name index — this is the
-        // visible-payoff scaffolding.
         auto* pEdit = *reinterpret_cast<CCtrlEdit**>(pBytes + 0x1570);
-        if (pEdit) {
-            DEBUG_MESSAGE("  edit ptr ok @0x%08X — search no-op pending name index",
-                          pEdit);
-        } else {
-            DEBUG_MESSAGE("  edit slot is NULL");
+        if (!pEdit) {
+            DEBUG_MESSAGE("  edit slot is NULL — search aborted");
+            return;
         }
+
+        // Pull the search text via CCtrlEdit::GetText @ 0x004842C0. The
+        // signature returns ZXString<char> by value — MSVC __thiscall
+        // passes the hidden return-buffer pointer on the stack (after the
+        // ECX = this). We materialize the ZXString locally; its dtor
+        // releases the refcounted buffer when it goes out of scope.
+        ZXString<char> sText;
+        reinterpret_cast<void(__thiscall*)(CCtrlEdit*, ZXString<char>*)>(
+            0x004842C0)(pEdit, &sText);
+        const char* pszQuery = static_cast<const char*>(sText);
+        if (!pszQuery || !*pszQuery) {
+            DEBUG_MESSAGE("  search query empty — no-op");
+            return;
+        }
+
+        // Lower-case the query for case-insensitive substring match.
+        std::string query(pszQuery);
+        std::transform(query.begin(), query.end(), query.begin(),
+                       [](unsigned char c) {
+                           return static_cast<char>(::tolower(c));
+                       });
+
+        DEBUG_MESSAGE("  search query=\"%s\"", query.c_str());
+
+        // Walk all 9 tabs; first card whose mob-name contains the query
+        // wins. KMST's CMonsterBookMan::SearchCard would prefer the
+        // current tab + tab order; we keep it simple — left-to-right tab
+        // walk, lowest cell index first.
+        auto* pCardTableArrays =
+            reinterpret_cast<ZArray<V95Ref>*>(pBytes + 0x1888);
+        for (int tab = 0; tab < 9; ++tab) {
+            auto& tabCards = pCardTableArrays[tab];
+            const uint32_t cnt = tabCards.GetCount();
+            for (uint32_t i = 0; i < cnt; ++i) {
+                auto& v95Ref = tabCards[i];
+                if (!v95Ref.p) continue;
+                const int32_t cardId = *reinterpret_cast<int32_t*>(v95Ref.p);
+                const int32_t mobId  = MonsterBook_ResolveMobId(cardId);
+                const std::string& name = MonsterBook_LookupMobName(mobId);
+                if (name.empty()) continue;
+                std::string nameLower(name);
+                std::transform(nameLower.begin(), nameLower.end(),
+                               nameLower.begin(),
+                               [](unsigned char c) {
+                                   return static_cast<char>(::tolower(c));
+                               });
+                if (nameLower.find(query) == std::string::npos) continue;
+
+                // Hit. Jump to that card.
+                auto* pLPTab = *reinterpret_cast<CCtrlLPTab**>(pBytes + 0x1564);
+                if (pLPTab) {
+                    pLPTab->m_nCurrentTab = tab;
+                }
+                g_nLeftPage     = static_cast<int32_t>(i / 25);
+                g_nSelectedCard = static_cast<int32_t>(i % 25);
+                DEBUG_MESSAGE("  match: \"%s\" (mob=%d card=%d) -> "
+                              "tab=%d page=%d sel=%d",
+                              name.c_str(), mobId, cardId,
+                              tab, g_nLeftPage, g_nSelectedCard);
+                MonsterBook_MarkLayerDirty(pBytes, 0x15A0);  // L0 grid
+                MonsterBook_MarkLayerDirty(pBytes, 0x15A8);  // L1 detail
+                MonsterBook_MarkLayerDirty(pBytes, 0x15B0);  // L2 cursor
+                return;
+            }
+        }
+        DEBUG_MESSAGE("  search: no match for \"%s\"", query.c_str());
         return;
     }
     case 0x07D1: {
@@ -1557,6 +1950,8 @@ static auto CWvsContext__UI_Open = kCWvsContext_UI_Open;
 static auto CWvsContext__UI_Close = kCWvsContext_UI_Close;
 static auto CWnd__Update = kCWnd_Update;
 static auto CWnd__OnChildNotify = kCWnd_OnChildNotify;
+static auto CUIWnd__HitTest = kCUIWnd_HitTest;
+static auto CUIWnd__OnMouseEnter = kCUIWnd_OnMouseEnter;
 
 void __fastcall CWnd__OnChildNotify_hook(void* pThis, void* /*EDX*/,
                                           uint32_t nId, uint32_t nMsg,
@@ -1579,6 +1974,32 @@ void __fastcall CWnd__OnChildNotify_hook(void* pThis, void* /*EDX*/,
     }
     reinterpret_cast<void(__thiscall*)(void*, uint32_t, uint32_t, int32_t)>(
         CWnd__OnChildNotify)(pThis, nId, nMsg, nLParam);
+}
+
+int32_t __fastcall CUIWnd__HitTest_hook(void* pThis, void* /*EDX*/,
+                                        int32_t rx, int32_t ry,
+                                        void** ppCtrl) {
+    // Cache wnd-local cursor coords for the polling click detector. Filter
+    // by pThis so other CUIWnd HitTest dispatches don't pollute our cache.
+    if (pThis != nullptr && pThis == g_pV95MonsterBookGlobal) {
+        g_nLastHitX = rx;
+        g_nLastHitY = ry;
+    }
+    return reinterpret_cast<int32_t(__thiscall*)(void*, int32_t, int32_t, void**)>(
+        CUIWnd__HitTest)(pThis, rx, ry, ppCtrl);
+}
+
+void __fastcall CUIWnd__OnMouseEnter_hook(void* pThis, void* /*EDX*/,
+                                          int32_t bEnter) {
+    // Invalidate the cached cursor coords when the mouse leaves our wnd
+    // so a subsequent click outside doesn't get attributed to the last
+    // in-wnd position. bEnter==0 means "cursor exiting".
+    if (pThis != nullptr && pThis == g_pV95MonsterBookGlobal && bEnter == 0) {
+        g_nLastHitX = -1;
+        g_nLastHitY = -1;
+    }
+    reinterpret_cast<void(__thiscall*)(void*, int32_t)>(
+        CUIWnd__OnMouseEnter)(pThis, bEnter);
 }
 
 void __fastcall CWnd__Update_hook(void* pThis, void* /*EDX*/) {
@@ -1686,4 +2107,14 @@ void AttachUIMonsterBook() {
     // latter placed the trampoline pointer inside an unrelated function
     // (CMemoryGameDlg::IsWinnerLastTime) → crashed on first close click.
     ATTACH_HOOK(CWnd__OnChildNotify, CWnd__OnChildNotify_hook);
+    // Hooks CUIWnd::HitTest — captures wnd-local mouse coords so the
+    // poll-driven cell click detector in MonsterBook_Update can hit-test
+    // m_aRect[] without doing the screen→canvas→wnd transform itself.
+    // Original is always invoked via the trampoline; we don't change the
+    // wnd-manager's hit-test result.
+    ATTACH_HOOK(CUIWnd__HitTest, CUIWnd__HitTest_hook);
+    // Hooks CUIWnd::OnMouseEnter — invalidates the HitTest cache when the
+    // cursor leaves our wnd, so post-leave clicks don't get attributed
+    // to the last in-wnd coords.
+    ATTACH_HOOK(CUIWnd__OnMouseEnter, CUIWnd__OnMouseEnter_hook);
 }
